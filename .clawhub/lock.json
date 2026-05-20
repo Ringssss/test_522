@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "skills": {
+    "skill-vetter": {
+      "version": "1.0.0",
+      "installedAt": 1775724195207
+    },
+    "code-review": {
+      "version": "1.0.0",
+      "installedAt": 1775724482169
+    },
+    "ontology": {
+      "version": "1.0.4",
+      "installedAt": 1775724543698
+    },
+    "planning-with-files": {
+      "version": "2.26.1",
+      "installedAt": 1775724563751
+    },
+    "self-improving-agent": {
+      "version": "3.0.13",
+      "installedAt": 1775724602655
+    }
+  }
+}

@@ -1,0 +1,56 @@
+现在我们继续代号v0.1-init-project的建设。
+
+【重要文件路径】
+项目根目录: $my_proj_dir = /home/wuhang/wuhang/dllm_wh
+
+
+codex测试代码目录：my_proj_dir/codex_coding/src
+codex测试结果目录：my_proj_dir/codex_coding/results
+重要文档目录：my_proj_dir/docx
+过程文档目录：my_proj_dir/code_building
+docx归档思路：my_proj_dir/docx/00_docx_storage_and_lookup_guide.md，请你归档到docx的时候阅读，看看文件应该属于什么类型，应该归档到哪个文件夹下
+模型路径：/mnt/models
+
+
+
+【整体任务信息】
+
+【本轮关键命令】
+无
+
+
+
+【建设原则】
+1. 如果代码里有注释，请用英文写；写进展文件的时候，用中文写。
+2. 请你随时做好code_building代码建设中间文档文件夹和docx重要文档文件夹层面的归档工作，所形成的文件放在docx文件夹和code_building中，使得我们整个建设流程有迹可循。
+3. 测试脚本统一放在codex_coding/src代码目录下，可以根据自己的里程碑任务再建立子目录，结果存在codex_coding/results结果目录下，保持库项目地址的干净。
+4. 确保每一次的建设结果和测试结果都要有形成过程文档，保存在过程文档目录下，方便溯源整个开发过程，子文件夹的命名规则是：vx.y-任务名称，内部是vx.y.z-本次归档主题。
+5. 在完成一个进展之后，要把进展增添式地重新同步到进度差异总结code_building/progress_diff_summary.md里，方便下次同步当前进度，并查看整体进度。
+6. 当你形成一个关键归档文件的时候，请你把这个文件的位置和基本内容总结增添式地保存到重要文件索引目录/home/wuhang/wuhang/dllm_wh/code_building/key_files_index.md下，方便必要的时候查找。
+7. 当你形成一个关键结论（比如公式推导结果）的时候，请你把这个结论同步到关键结论文件/home/wuhang/wuhang/dllm_wh/code_building/key_conclusion.md下，以保证该文件中的结论都是最新的，以免我们被历史文件中的推导误导。
+8. 一旦有什么疑惑就去搜索相应的代码，当我们感到盲目的时候就去收集信息。
+9. 在你添加进展的时候，把【本轮命令】也加进去，让我们知道这次信息的指令是什么。
+10. 并不是每一次都需要在code_building/process_docs新建一个文件，大多时候只需要写在上一个进度文件中即可，只有任务主题进入下一阶段了，我们才需要新建一个新的文件。
+
+【上下文压缩前归档必做清单】
+每次上下文即将压缩时，必须完成以下归档，确保失忆后看完就能跟上当前状态：
+
+| # | 归档项 | 文件路径 | 说明 |
+|---|--------|---------|------|
+| 1 | 过程文档 | `code_building/process_docs/v0.1-init-project/v0.1.15.XX-主题.md` | 本轮所有实验数据、分析和结论 |
+| 2 | 进度差异总结 | `code_building/progress_diff_summary.md` | 增量追加本轮进展+关键命令 |
+| 3 | 关键文件索引 | `code_building/key_files_index.md` | 新产出的文件路径+作用 |
+| 4 | 关键结论 | `code_building/key_conclusion.md` | 本轮形成的关键结论（最新优先） |
+| 5 | 恢复记忆文件 | `history-chat.txt` | 覆盖为本轮恢复说明模版 |
+
+过程文档详细程度要求（参考 v0.1.15.16）：
+- 每个实验必须包含：**设计动机、实现方式、命令、数据表格、结论**
+- 不能只写总结性结论，必须有支撑数据
+- 实验编号连续，失败的实验也要记录（含失败原因和排除的方向）
+
+恢复记忆文件（history-chat.txt）要求：
+- 包含所有关键状态变量的当前值（最优配置、path counts、ms/fwd 等）
+- 列出失忆后必读文档的完整路径和阅读顺序
+- 包含"最重要的恢复记忆句"（一段话概括本轮核心结论和下一步方向）
+- 包含代码改动清单（哪些文件改了什么）
+- 包含已排除方向的完整列表（避免重复尝试）

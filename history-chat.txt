@@ -1,0 +1,189 @@
+【
+上一轮信息：
+
+1. 开发规范入口仍然是：
+
+- /home/wuhang/wuhang/dllm_wh/docx/next_step.txt
+- /home/wuhang/wuhang/dllm_wh/docx/00_docx_storage_and_lookup_guide.md
+
+关键规范总结：
+
+- 当前阶段代号：v0.1-init-project
+- 项目根目录：/home/wuhang/wuhang/dllm_wh
+- 测试脚本放：codex_coding/src
+- 测试结果放：codex_coding/results
+- 过程文档放：code_building/process_docs/v0.1-init-project
+- 每次进展同步到：code_building/progress_diff_summary.md
+- 关键文件同步到：code_building/key_files_index.md
+- 关键结论同步到：code_building/key_conclusion.md
+- 代码注释用英文；归档说明用中文
+- 不要随意回滚用户已有改动
+
+**压缩前归档必做清单**（每次上下文压缩前必须完成）：
+| # | 归档项 | 文件路径 | 说明 |
+|---|--------|---------|------|
+| 1 | 过程文档 | `code_building/process_docs/v0.1-init-project/v0.1.15.24-paper_experiment_baseline_bench_and_cross_framework_comparison.md` | 本轮所有实验数据、分析和结论 |
+| 2 | 进度差异总结 | `code_building/progress_diff_summary.md` | 增量追加本轮进展+关键命令 |
+| 3 | 关键文件索引 | `code_building/key_files_index.md` | 新产出的文件路径+作用 |
+| 4 | 关键结论 | `code_building/key_conclusion.md` | 本轮形成的关键结论（最新优先） |
+| 5 | 恢复记忆文件 | `history-chat.txt` | 覆盖为本轮恢复说明模版 |
+每项都要信息密度充足，确保失忆后看完就能跟上当前状态。
+
+2. 本轮核心主题：论文实验 Baseline Bench + 跨框架对比
+
+本轮从论文实验需求出发，搭建了公平的 benchmark 对比框架：
+(a) 编写 bench_baseline_dinfer.py，用原装未修改的 baseline_dInfer 建立真 baseline
+(b) 编写 bench_sglang_dllm.py，用 SGLang 的 LowConfidence 算法做跨框架对比
+(c) 修复 TV6 在 DP=1 下的兼容性问题（三处代码改动）
+(d) 在统一配置下完成四种引擎的 benchmark 数据采集
+
+3. 当前核心数据（GSM8K, pad=128, gen=256, block=32, threshold=0.90, TP=4, 4GPU）
+
+| 引擎 | batch=32 ms/fwd (fwd) | batch=256 ms/fwd (fwd) |
+|------|----------------------|----------------------|
+| dInfer w/o cache | 77.43 (208) | OOM |
+| dInfer w/ cache | 48.13 (204) | 98.92 (234) |
+| SGLang flashinfer no-graph | 40.30 (231) | 待测（max_rr=256 时 OOM） |
+| Ours Vanilla d1t4e4 | 40.26 (201) | 65.10 (235) |
+| Ours TV6 d1t4e4 | 47.66 (234) | 49.18 (255) |
+| Ours Vanilla d2t4e8 (8GPU) | 52.06 (205) | 58.82 (230) |
+| Ours TV6 d2t4e8 (8GPU) | 53.55 (233) | 54.22 (253) |
+
+4. TV6 完整配置（不变）
+
+- TP=4, DP=2（或 DP=1 for d1t4e4）, EP=8（或 4）
+- EB K=4, K_target=40, q_major=1.0
+- BSP-G: attention ReduceScatter + SP layout
+- TV6 compact dispatch/combine + in-place MoE cache + M=5 refresh
+- DINF_SKIP_LOGITS_FLOAT=1, DINF_SP_LM_HEAD=1
+- BlockDiffusionLLM + prefix cache
+- apply_all_optimizations: fused_rmsnorm + flash_attn
+
+5. TV6 DP=1 修复详情（tv6_patch.py 三处改动）
+
+改动 1: apply_tv6 开头手动初始化 EP group 的 all2all_manager（vllm 只在 dp>1 时初始化）
+改动 2: tv6_forward_impl 中 dp_metadata is None 时创建临时 DPMetadata（vllm 只在 dp>1 时创建）
+改动 3: fallback 路径（compute_mask_sp is None）加 _run_full_moe 函数——DP=1 时 orig_fn 不做 dispatch/combine 导致只有本地 64 experts 贡献，改为手动 dispatch → kernel → combine
+
+修复后 fwd count 从 257 降到 234（fallback 输出不完整导致的多余迭代被消除），DP=2 未被破坏。
+
+6. Attention 实现确认
+
+- Baseline dInfer: LLaDA2MoeSdpaAttention → F.scaled_dot_product_attention
+- 我们的系统: LLaDA2MoeSdpaAttention → apply_flash_attn_classic 替换 forward → 无 attn_mask 时 flash_attn_func，有 attn_mask 时 SDPA fallback
+- BlockDiffusionLLM prefix cache 路径下，block 内迭代不传 attn_mask → 走 flash_attn（~95% forward）
+- cross_block 和 prefill 有 attn_mask → 走 SDPA（~5%）
+- SGLang: FlashInfer（ENCODER_ONLY, causal=False），只有 flashinfer 和 torch_native 可用，fa3 对 dLLM 不兼容
+
+7. 框架机制分析
+
+- dInfer naive_batching: 无 intra-block batch shrinking（select_undecoded 空实现），已完成序列陪跑
+- dInfer dynamic_batching: 有 per-seq 异步调度（mini_batch_size），但需要 sglang backend
+- Fast-dLLM: 有 block 间 batch shrinking（物理缩减 batch + KV cache slice）
+- SGLang: 请求级动态调度 + Paged KV 释放，天然无陪跑；默认 max_running_requests 由用户设置
+
+8. 已排除的方向
+
+| 方向 | 结果 | 原因 |
+|------|------|------|
+| 所有 v0.1.15.23 排除方向 | 见 v0.1.15.23 history-chat | — |
+| Baseline TP=8 | crash | kv_heads=4 不够被 8 整除 |
+| Baseline batch=512 cache | OOM | logits.float() 需 19.19 GiB |
+| Baseline batch=256 no-cache | OOM | O(batch×seq²) attn 需 28.78 GiB |
+| 给 baseline 加 DP=2 | 不做 | DP 支持是我们的贡献 |
+| TV6 动态 SP 开关 | 不做 | 需两套 decoder forward，改动大收益有限 |
+| SGLang fa3 backend | crash | 不支持 ENCODER_ONLY bidirectional |
+| Fast-dLLM batch shrinking 迁移 | 不做 | KV cache dense tensor memcpy 成本太高 |
+
+9. 代码改动清单
+
+修改的文件：
+- `codex_coding/src/bench_baseline_dinfer.py` — 完全重写为 torchrun + TP=4 + GSM8K bench
+- `codex_coding/src/bench_tv6_throughput.py` — 加 --pad-to, --tp-size 参数
+- `codex_coding/src/tv6_patch.py` — DP=1 兼容性修复（3 处 + _run_full_moe 函数）
+- `lib_cite/sglang/python/sglang/srt/dllm/algorithm/low_confidence.py` — 加 _FWD_COUNTER
+
+新增的文件：
+- `codex_coding/src/bench_sglang_dllm.py` — SGLang dLLM benchmark
+- `codex_coding/src/_sglang_bench_config.yaml` — SGLang threshold 配置
+
+未修改的文件：
+- `lib_cite/baseline_dInfer/` — 不动 ✅
+- `lib_cite/dInfer/python/dinfer/` — 不动 ✅
+- `bench_bsp_moe_dp2.py` — 不动 ✅
+
+10. 环境配置
+
+| 环境名 | 用途 | torch | vllm | 关键依赖 |
+|--------|------|-------|------|---------|
+| dllm | 我们的系统（TV6/Vanilla） | 2.8.0+cu128 | 0.10.2 | flash_attn 2.8.3 |
+| dllm_base | Baseline dInfer | 2.8.0+cu128 | 0.10.2 | — |
+| dllm_sglang | SGLang | 2.9.1+cu128 | 0.11.0 | sgl_kernel 0.4.1.post1 |
+
+11. 失忆后建议的恢复顺序
+
+先看规范和优化路线图：
+- /home/wuhang/wuhang/dllm_wh/docx/next_step.txt
+
+再看本轮过程文档（最重要）：
+- /home/wuhang/wuhang/dllm_wh/code_building/process_docs/v0.1-init-project/v0.1.15.24-paper_experiment_baseline_bench_and_cross_framework_comparison.md
+
+再看上轮过程文档（动机图 + TV6 Patch 基础）：
+- /home/wuhang/wuhang/dllm_wh/code_building/process_docs/v0.1-init-project/v0.1.15.23-paper_experiment_motivation_figures_and_tv6_patch.md
+
+再看 key_conclusion.md（看 2026-05-11 section）：
+- /home/wuhang/wuhang/dllm_wh/code_building/key_conclusion.md
+
+再看 insight ledger:
+- /home/wuhang/wuhang/dllm_wh/docx/context_index/04_insight_ledger.md
+
+再看 bench 脚本和 TV6 patch（关注 DP=1 修复）：
+- /home/wuhang/wuhang/dllm_wh/codex_coding/src/bench_baseline_dinfer.py
+- /home/wuhang/wuhang/dllm_wh/codex_coding/src/bench_sglang_dllm.py
+- /home/wuhang/wuhang/dllm_wh/codex_coding/src/bench_tv6_throughput.py
+- /home/wuhang/wuhang/dllm_wh/codex_coding/src/tv6_patch.py（关注 _run_full_moe 和 dp_size 判断）
+
+12. 最重要的恢复记忆句
+
+本轮搭建了论文实验的完整 benchmark 对比框架。核心成果：(1) 用原装 baseline_dInfer（TP=4, 4GPU, sdpa, K=8）建立了真 baseline——batch=32 时 48.13 ms/fwd，batch=256 时 98.92 ms/fwd，batch=512 OOM；(2) 用 SGLang LowConfidence（flashinfer, no CUDA Graph）做跨框架对比——40.30 ms/fwd 和我们的 Vanilla 40.26 ms/fwd 基本持平，证明 FlashInfer ≈ flash_attn 在 ms/fwd 层面等价；(3) 修复了 TV6 在 DP=1 下的兼容性问题（手动初始化 all2all_manager + 创建临时 DPMetadata + fallback 路径 _run_full_moe），使 TV6 d1t4e4 可以和 baseline 同口径对比——batch=256 时 49.18 vs 98.92 ms/fwd（快 50%）；(4) 确认小 batch 下 DP=2 比 DP=1 慢 29% 是 AllToAll collective overhead，不是 TV6 本身的问题。待完成项：SGLang batch=256 max_running_requests=256 的测试（之前 OOM，需要确认），以及论文实验数据表最终确认。四种引擎的配置和启动命令已全部确定，脚本已写好可直接跑。
+
+这一轮：
+请你先回顾一下上一轮我们做了什么，然后，这一轮你的任务如下：
+
+0. 先明确当前项目与规范（必须先读）
+
+- 项目根目录：/home/wuhang/wuhang/dllm_wh
+- 当前阶段代号：v0.1-init-project
+- 开发规范入口：/home/wuhang/wuhang/dllm_wh/docx/next_step.txt
+
+1. 先重新阅读这些"状态总览"文档（按顺序）
+
+- /home/wuhang/wuhang/dllm_wh/code_building/process_docs/v0.1-init-project/v0.1.15.24-paper_experiment_baseline_bench_and_cross_framework_comparison.md（本轮过程文档，最重要）
+- /home/wuhang/wuhang/dllm_wh/code_building/process_docs/v0.1-init-project/v0.1.15.23-paper_experiment_motivation_figures_and_tv6_patch.md（上轮动机图 + TV6 Patch）
+- /home/wuhang/wuhang/dllm_wh/code_building/key_conclusion.md（看 2026-05-11 section）
+
+2. 再看 bench 脚本和 TV6 patch 代码
+
+- /home/wuhang/wuhang/dllm_wh/codex_coding/src/bench_baseline_dinfer.py — Baseline dInfer benchmark
+- /home/wuhang/wuhang/dllm_wh/codex_coding/src/bench_sglang_dllm.py — SGLang dLLM benchmark
+- /home/wuhang/wuhang/dllm_wh/codex_coding/src/bench_tv6_throughput.py — TV6/Vanilla throughput benchmark
+- /home/wuhang/wuhang/dllm_wh/codex_coding/src/tv6_patch.py — TV6 patch（关注 DP=1 修复：_run_full_moe, dp_size 判断）
+
+3. 必须恢复的关键认知
+
+- 四种引擎配置已确定：dInfer w/o cache、dInfer w/ cache、SGLang、Ours（Vanilla 或 TV6 取最优）
+- 统一实验参数：GSM8K, pad=128, gen=256, block=32, threshold=0.90, TP=4, 4GPU
+- 只测 batch=32 和 batch=256
+- SGLang 的 max_running_requests = batch_size（OOM 就记 OOM）
+- TV6 已支持 DP=1 和 DP=2（tv6_patch.py 修复后）
+- 小 batch 下 Ours 选 Vanilla（无 SP overhead），大 batch 选 TV6（compact dispatch 收益）
+- Baseline 受限于 TP=4（kv_heads=4），batch=512 OOM，batch=256 no-cache OOM
+
+4. 下一步应该做的事
+
+(a) 跑 SGLang batch=256 max_running_requests=256（预计 OOM，记录即可）
+(b) 确认最终论文实验数据表
+(c) 开始论文写作或继续其他实验设计
+
+得到用户确认后再开始建设。
+】

@@ -1,0 +1,58 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# huge files
+*.pt
+*.gz
+*.nsys-rep
+*.sqlite
+/codex_coding/results/
+/codex_coding/long_results/
+/data/full_datasets/
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Build / package
+build/
+dist/
+*.egg-info/
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Secrets / local config
+.env
+.env.*
+*.pem
+*.key
+
+# Temporary files
+tmp/
+temp/
+*.swp
+*~
+
+# Your local ignored directory
+/lib_cite/*
+/others/*
+
+# keep this repo/subdir tracked
+!/lib_cite/dInfer/
+!/lib_cite/dInfer/**

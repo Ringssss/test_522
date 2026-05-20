@@ -1,0 +1,822 @@
+\documentclass[sigconf,review,anonymous, 10pt]{acmart}
+
+% ============================================================
+% Epoch -- EuroSys 2027 manuscript (refined draft).
+%
+% Refactor goals over the previous draft:
+%   * Open with the workload, not the solution.  Figure 1 now shows
+%     what dLLM block diffusion *is*, so the reader meets the problem
+%     before meeting the answer.
+%   * Push the abstraction figure (forward-scoped vs block-scoped) to
+%     the design overview, where it acts as the bridge between the
+%     three motivation observations and the system itself.
+%   * Make the three motivation observations the spine of the paper:
+%     each observation maps to one mechanism, and the figure for each
+%     observation precedes the mechanism that consumes it.
+%   * Tighten language; cut placeholder footnotes; keep every claim
+%     close to a measured or explicitly modelled fact.
+%
+% Figures are precise placeholders.  Each \figbox{title}{plan}
+% expands to a framed visual brief that tells the figure-maker what
+% the panel must contain to discharge its argumentative role.
+% ============================================================
+
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{array}
+\usepackage{pifont}
+\usepackage{graphicx}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{listings}
+\usepackage{balance}
+
+\definecolor{todored}{RGB}{160,30,30}
+\definecolor{maskgreen}{RGB}{55,130,85}
+\definecolor{decodedgray}{RGB}{120,120,120}
+\definecolor{planblue}{RGB}{45,85,160}
+\definecolor{commorange}{RGB}{190,105,35}
+
+\newcommand{\todo}[1]{\textcolor{todored}{\textbf{[TODO: #1]}}}
+\newcommand{\resulttodo}[1]{\textcolor{todored}{\textbf{[RESULT TODO: #1]}}}
+\newcommand{\sys}{Epoch}
+\newcommand{\mask}{\textsc{Mask}}
+\newcommand{\decoded}{\textsc{Decoded}}
+\newcommand{\figbox}[2]{%
+\fbox{%
+\begin{minipage}{0.96\linewidth}
+\vspace{0.4em}
+\textbf{#1}\\[0.25em]
+{\small #2}
+\vspace{0.4em}
+\end{minipage}}}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=single,
+  breaklines=true
+}
+
+\settopmatter{printfolios=true}
+
+\title{Epoch: Block-Scoped Sparse MoE Execution for Diffusion Language Model Inference}
+
+\author{Anonymous Authors}
+\affiliation{\institution{Paper under submission}}
+\email{anonymous@example.com}
+
+\begin{document}
+
+\begin{abstract}
+Diffusion language models (dLLMs) generate text by iteratively refining fixed-size blocks of tokens---running a dozen or more forward passes over the same set of token positions before the block is finalized.
+This pattern violates an assumption baked into modern LLM serving systems: that the forward pass is an atomic, self-contained unit of work.
+A per-forward runtime cannot see that, inside a block, every iteration repeats the same routing decisions, moves the same token shards through expert-parallel collectives, and recomputes outputs for positions whose decode decisions are already final.
+The redundancy is structural, but lives at a granularity no existing abstraction names.
+
+This paper presents \sys, a serving system that elevates the diffusion block to a first-class execution unit.
+\sys{} plans a sparse execution graph at each block boundary and reuses the graph across the block's iterations, while recomputing every numerical value that can change a live decode decision.
+The design follows one rule: \emph{cache execution structure, never live values}.
+This rule gives the system a precise correctness boundary and keeps block-scoped reuse safe.
+
+\sys{} carries block-scoped sparsity through four runtime boundaries that previously forced dense work.
+\emph{Expert Budget} profiles routing at block start and constrains each MoE layer to a small coverage-driven expert support; gate logits are recomputed every iteration, but only experts inside the support can be selected.
+\emph{Sparse Sequence Parallelism} keeps token shards local to ranks so that \mask{}-token liveness becomes visible to the MoE runtime.
+\emph{Sparse Communication} compacts expert-parallel dispatch and combine to live \mask{} tokens, encoding decoded-token skip through a runtime-only null-expert marker that needs no MoE-kernel changes.
+A \emph{sequence-parallel LM head} decodes locally and gathers compact token decisions in place of dense logits.
+
+We implement \sys{} on 8 NVIDIA H100 GPUs and evaluate it on three diffusion MoE models, LLaDA2.0-mini (16B), LLaDA2.0-Flash (100B), and LLaDA2.1-Flash (100B).
+On LLaDA2.0-mini, \sys{} reduces per-forward latency from 76.4\,ms to 58.2\,ms, a 1.31$\times$ speedup over an already-optimized dense MoE baseline, with no measurable loss in generation quality.
+\resulttodo{Add full results for LLaDA2.0-Flash and LLaDA2.1-Flash, end-to-end throughput, and the full sparse-communication path.}
+\end{abstract}
+
+\maketitle
+
+% ============================================================
+% Introduction
+% ============================================================
+\section{Introduction}
+
+Modern LLM serving systems are built around one assumption: a request grows one token per forward pass.
+Autoregressive (AR) decoding extends a prefix, so the forward pass is the natural scheduling unit and the KV cache is the natural reuse mechanism.
+Every layer of today's serving stack---batching, scheduling, parallelism, memory management---inherits this assumption.
+
+Diffusion language models (dLLMs) break it.
+A dLLM generates text in fixed-size blocks: it initializes a block as a sequence of \mask{} tokens, runs a full forward over the block, lets a decoder commit high-confidence positions, and repeats this iterative refinement until the block is complete before moving on.
+The shape of work changes accordingly.
+Generating 256 tokens with a block size of 32 yields eight blocks, and each block typically requires roughly a dozen refinement iterations---so the same logical token positions are re-executed dozens of times before they are finalized.
+Figure~\ref{fig:block-mechanics} illustrates this pattern.
+A per-forward runtime sees only a stream of independent dense MoE forwards.
+A runtime that recognizes the block sees a stable iterative region with internal structure to exploit.
+
+% --- Figure 1: BACKGROUND.  Show the workload, not the solution. ---
+\begin{figure}[t]
+\centering
+\figbox{Figure 1 visual plan: block diffusion mechanics.}{
+Single panel.  Vertical axis: iteration index $0,1,2,\ldots,T{-}1$.  Horizontal axis: token positions inside one block (e.g.\ 16 positions to fit single-column).  At iteration~0, every cell is a green \mask{}.  At iteration~1, a few cells flip to grey \decoded{}; in iterations 2 and 3, the grey region grows monotonically; by the last iteration, almost all cells are grey.  Token positions stay fixed across rows---this is the central visual point.  Annotate one row with ``threshold decoder commits high-confidence positions''.  Annotate the right margin with ``$\sim$12 forwards/block, same positions every time''.  No solution is shown.  This figure simply teaches the reader what the workload is.}
+\caption{Block diffusion refines a fixed set of token positions across many iterations.  Per-forward serving stacks see this as a stream of independent dense forwards.}
+\label{fig:block-mechanics}
+\end{figure}
+
+This paper argues that the right execution unit for sparse MoE diffusion inference is not a forward pass but a diffusion block.
+A block has a clear beginning and end, contains repeated execution over a fixed set of token positions, and provides a natural invalidation guard---a plan built for one block expires when the next begins.
+The block is therefore what the forward pass is not: a region of work where structure is stable enough to plan against.
+
+The block-scoped view immediately invites a tempting but unsafe optimization: cache MoE outputs across iterations because the iterations look similar.
+The optimization is unsafe because the logits of \mask{} tokens determine which positions get committed in the current iteration, and small numerical errors there can change a decode decision and propagate through the rest of the block.
+We therefore commit to a stricter design rule:
+
+\begin{quote}\emph{Plan the stable structure. Recompute every live value. Propagate sparsity across boundaries.}\end{quote}
+
+\noindent The stable structure is the active expert support, the token-to-rank ownership, the compact live-token indices, and the cache layout.
+The live values are gate logits, MoE outputs for \mask{} tokens, and decode decisions.
+\sys{} caches the former and recomputes the latter on every iteration.
+
+Under this rule, the block exposes four forms of redundancy that no per-forward runtime can address.
+\textbf{(R1) Routing has block-local support stability.} Top-$k$ choices may shift between iterations, but the \emph{set} of experts absorbing most of the routing mass changes slowly within a block.
+\textbf{(R2) Decoded-token MoE work is decision-inactive.} Once threshold decoding commits a position, fresh logits at that position no longer feed back into a decode decision in subsequent iterations, even though the position remains part of the model state.
+\textbf{(R3) Sparse compute is undone by dense communication.} Skipping decoded-token compute is wasted effort if expert-parallel dispatch and combine still move every local token through the network.
+\textbf{(R4) Dense logits at the output boundary undo earlier sparsity.} Materializing a full vocabulary-sized logit vector for every position---including positions whose values will be ignored---reintroduces dense work right before the threshold decoder.
+
+\sys{} addresses all four through a single planner that reuses one set of block-scoped metadata across the entire decoder stack.
+At block start, \emph{Expert Budget} profiles candidate routes and constructs an active expert support $S_l$ for each MoE layer.
+During hot iterations, the router computes fresh gate logits but only selects within $S_l$.
+\emph{Sparse Sequence Parallelism} keeps each rank holding---and identifying the live \mask{} subset of---its own token shard.
+\emph{Sparse Communication} extracts the live tokens, dispatches and combines only those tokens, encodes decoded-token skip through a runtime-only null expert that requires no kernel changes, and merges fresh outputs with cached outputs at the layer boundary.
+The LM head stays sequence-parallel: each rank decodes locally and the system gathers compact token decisions instead of vocabulary-sized logits.
+
+This paper makes four contributions.
+\textbf{(1)}~We identify the diffusion block as the right abstraction for sparse MoE serving in dLLMs and articulate a precise correctness rule---cache structure, recompute live values---that distinguishes safe block-scoped reuse from unsafe result caching.
+\textbf{(2)}~We design \emph{Expert Budget}, a coverage-driven expert-support planner that captures most of a block's routing mass with a small subset of experts while preserving per-iteration gate adaptivity.
+\textbf{(3)}~We design a token and communication pipeline that propagates \mask{}-token liveness through sequence-parallel attention, sparse expert dispatch and combine, decoded-cache merge, and a sequence-parallel LM head; the pipeline integrates with existing fused-MoE kernels through narrow runtime hooks.
+\textbf{(4)}~We implement \sys{} on 8 H100 GPUs and evaluate it on three diffusion MoE models (16B--100B), showing a 1.31$\times$ per-forward speedup on LLaDA2.0-mini over an already-optimized dense baseline without measurable quality loss\resulttodo{; full results on the two 100B models will accompany the camera-ready}.
+
+% ============================================================
+% Background
+% ============================================================
+\section{Background}
+
+\subsection{Block Diffusion Inference}
+
+A block diffusion model generates text in fixed-size blocks rather than one token at a time.
+For each block, the model initializes all token positions as \mask{} tokens and runs the full transformer over the block.
+The resulting logits drive a decoder that commits high-confidence positions and leaves the rest masked, and the model then runs again over the same block.
+Under the threshold-decoding policy we study, a position committed in iteration $i$ stays committed in all later iterations of the same block, so the live \mask{} set shrinks monotonically until the block finishes.
+
+This shape is the central difference from autoregressive decoding.
+AR decoding appends new positions and never revisits prior ones; block diffusion refines a fixed set of positions over many iterations.
+The distinction looks small at the algorithm level, but at the runtime level it is decisive: block diffusion produces a stream of forwards over identical token positions, and that repetition is what \sys{} learns to exploit.
+
+\subsection{MoE Inference}
+
+Mixture-of-Experts (MoE) layers replace dense feed-forward computation with conditional computation gated by a router.
+For each token, the router computes gate logits, the runtime selects the top-$k$ experts, dispatches the token's hidden state to the ranks that own those experts, and combines the per-expert outputs back into token order.
+At scale, MoE inference combines tensor parallelism (TP, which partitions weights across ranks) with expert parallelism (EP, which partitions experts across ranks); together they make MoE the dominant source of collective communication in modern serving systems~\cite{vllm,sglang,moe}.
+Critically, a dense MoE runtime dispatches and combines \emph{every} local token on \emph{every} forward, with no notion of whether a token is still live for a downstream decode decision.
+
+\subsection{Why Existing Abstractions Miss the Opportunity}
+
+Existing serving systems schedule, batch, and parallelize at the granularity of an individual forward pass.
+This granularity matches AR generation, where each forward genuinely is an independent piece of work that extends the prefix by one token.
+For block diffusion, the forward-pass abstraction is too narrow to express the structure that matters.
+It cannot say that many forwards belong to the same block, that the token set is fixed across them, that decoded positions have different liveness from \mask{} positions, or that a routing graph computed once can safely be reused for the rest of the block.
+The structural opportunity is real, but it lives at a granularity no existing abstraction names.
+
+% ============================================================
+% Motivation
+% ============================================================
+\section{Motivation: Where the Redundancy Lives}
+
+We now show why per-forward MoE execution wastes work on dLLMs.
+The bottleneck is not a slow kernel that a better implementation can fix---it is the granularity at which the runtime reasons about work.
+A forward-scoped runtime cannot see that most of what it is recomputing has already been planned and decided.
+Section~\ref{sec:baseline-cost} quantifies this gap on an optimized dense baseline.
+Sections~\ref{sec:obs-routing}--\ref{sec:obs-comm} present three observations (O1--O3), each of which motivates a specific component of \sys{}'s design.
+
+\subsection{Baseline Cost}
+\label{sec:baseline-cost}
+
+Our baseline is an optimized dense dLLM MoE runtime running LLaDA2.0-mini on 8 H100 GPUs with tensor, expert, and data parallelism.
+For a representative configuration, this baseline takes 76.4\,ms per forward.
+MoE expert computation, expert dispatch, and expert combine together account for the largest fraction of this time, with the LM head and dense logit materialization contributing visible additional cost (Figure~\ref{fig:baseline-breakdown}).
+Crucially, the baseline is not a strawman: it uses fused MoE kernels, fused RMSNorm, FlashAttention, and tuned collective parallelism.
+The waste \sys{} targets is not implementation slack but redundancy that is invisible at the forward-pass granularity.
+
+\begin{figure}[t]
+\centering
+\figbox{Figure 2 visual plan: baseline component breakdown.}{
+Single horizontal stacked bar.  X-axis: ms per forward.  Total: 76.4\,ms.  Segments, in order: MoE kernel, MoE dispatch, MoE combine, attention, LM head, dense logit cast, TP collectives, shared expert, routing, norms, other.  Use the orange palette segment for the two communication categories (dispatch, combine) so the reader sees that the obvious target -- the MoE kernel -- is not the only place time goes.  Below the bar, a one-line note: ``Baseline includes fused RMSNorm, FlashAttention, fused MoE kernels.'' This pre-empts the strawman criticism.}
+\caption{Optimized dense per-forward execution still spends substantial time in MoE computation, expert communication, and output decoding.  The waste \sys{} targets is structural, not algorithmic.}
+\label{fig:baseline-breakdown}
+\end{figure}
+
+\subsection{Observation 1: Routing Support Is Block-Locally Stable}
+\label{sec:obs-routing}
+
+Across iterations of the same block, the gate logits change, hidden states drift, and individual top-$k$ expert choices shift.
+Caching MoE \emph{outputs} across iterations is therefore unsafe for live \mask{} tokens, whose logits feed back into the decoder.
+However, the \emph{support} of the routing graph---the set of experts that absorbs most of the routing mass---is far more stable than its values (Figure~\ref{fig:routing-stability}).
+Inside a block, the same fixed token positions are refined repeatedly, and the active expert subset that covers most routing mass evolves slowly even as individual gate weights move.
+
+This observation suggests a clean split between what can and cannot be reused.
+The system can plan---and cache---the active expert support for the duration of a block, but must continue to recompute gate logits and route fresh values within that planned support every iteration.
+\sys{} encodes this split in its \emph{Expert Budget} mechanism (\S\ref{sec:expert-budget}).
+
+\begin{figure}[t]
+\centering
+\figbox{Figure 3 visual plan: routing support stability.}{
+Three small heatmaps in a row, with a side summary.  Each heatmap: x-axis and y-axis are iteration indices inside one block; cell value is Jaccard overlap of the active expert support between iteration $i$ and iteration $j$.  Three panels: ``Layer 4 (early)'', ``Layer 10 (middle)'', ``Layer 18 (late)''.  Color scale: white to deep blue, darker means higher overlap; print the mean overlap inside each subplot title.  Side bar: stacked bar showing fraction of block iterations that hit \emph{cold}, \emph{hot-skip}, and \emph{hot-update} planner paths.  Caption note: ``Values vary across iterations; support does not.''}
+\caption{Top-$k$ choices vary, but the \emph{set} of experts that absorbs most of a block's routing mass overlaps strongly across iterations.}
+\label{fig:routing-stability}
+\end{figure}
+
+\subsection{Observation 2: Decode-Decision Liveness Shrinks Monotonically}
+\label{sec:obs-mask}
+
+Threshold decoding only consults the logits of \emph{currently masked} positions when deciding what to commit; it never reconsiders an already-decoded position.
+Decoded positions are therefore inactive on the direct decode-decision path, even though they remain part of the model's state---their hidden states still participate in attention and residual computation, and so their representations cannot simply be discarded.
+Figure~\ref{fig:mask-ratio} shows that the live \mask{} fraction shrinks rapidly: by the third or fourth iteration of a block, most positions are already decoded.
+
+This is a narrower but actionable fact: the system can skip the MoE work that produces \emph{output values} for decoded positions, as long as it preserves enough of those positions' state to keep the rest of the layer correct.
+\sys{} exploits this in two coordinated ways: it computes fresh MoE outputs only for live \mask{} tokens, and it merges those fresh outputs with cached MoE outputs for decoded tokens so that downstream layers still receive a full local tensor (\S\ref{sec:sparse-sp}).
+
+\begin{figure}[t]
+\centering
+\figbox{Figure 4 visual plan: \mask{} ratio over block iterations.}{
+Single line plot.  X-axis: iteration index inside a block, $0$ to $T$.  Y-axis: \mask{} ratio (live tokens / block size).  Three lines, one per model: LLaDA2.0-mini, LLaDA2.0-Flash, LLaDA2.1-Flash, with shaded $25$--$75$\% prompt-level bands.  Add a dashed horizontal line at the steady-state \mask{} ratio used in the communication payload analysis.  Annotate iteration $\sim$3 with ``most positions decoded by here''.}
+\caption{The live \mask{} set shrinks monotonically inside a block, so token liveness becomes a useful planning input.  Decoded positions remain in the model state; only their direct contribution to the next decode decision is inactive.}
+\label{fig:mask-ratio}
+\end{figure}
+
+\subsection{Observation 3: Sparse Compute Is Wasted Without Sparse Communication}
+\label{sec:obs-comm}
+
+Skipping decoded-token MoE compute is necessary but not sufficient.
+If expert-parallel dispatch and combine still move \emph{every} local token through the network, the runtime continues to pay the bandwidth and latency cost of decoded tokens, and the gains from sparse compute are silently absorbed by the collective.
+For sparse compute to translate into end-to-end speedup, expert communication must itself become sparse: dispatch must carry only live \mask{}-token states, combine must return only live outputs, and the system must reconstruct the full local tensor from a combination of fresh and cached values (Figure~\ref{fig:comm-waste}).
+\sys{} addresses this with a sparse dispatch/combine pipeline and a runtime-only null-expert encoding (\S\ref{sec:sparse-comm}).
+
+\begin{figure}[t]
+\centering
+\figbox{Figure 5 visual plan: dense communication waste.}{
+Two horizontal rows of EP ranks, four ranks each.  Top row: ``baseline / SP-only''---each rank sends \emph{all} local tokens (mix of green \mask{} and grey \decoded{}) along thick orange dispatch arrows; receivers receive equally large mixed bundles.  Bottom row: ``\sys{} sparse comm''---each rank sends only its compact green \mask{} subset; the orange arrows are visibly thinner and shorter.  Inset on the right: small horizontal bar chart of dispatch payload bytes per forward, three bars: dense, SP only, SP + sparse comm.  Note alongside the inset: ``decoded tokens bypass communication; they reappear at the cache merge.''}
+\caption{Token sparsity must cross the expert-parallel communication boundary, or dense collectives silently absorb every byte saved by sparse compute.}
+\label{fig:comm-waste}
+\end{figure}
+
+% ============================================================
+% Design Overview -- now featuring the abstraction figure
+% ============================================================
+\section{From Observations to an Abstraction}
+\label{sec:abstraction}
+
+The three observations above all point in the same direction: they each name a redundancy that is invisible to the per-forward runtime but trivially visible to a runtime that understands the diffusion block.
+This is more than a coincidence---it tells us that the per-forward abstraction is itself the bottleneck.
+
+Figure~\ref{fig:abstraction} makes this concrete.
+On the left, a forward-scoped runtime sees a stream of independent forwards.
+Each forward independently rediscovers the routing graph, dispatches and combines every local token, and materializes a dense logit vector at the output.
+The runtime has no memory across forwards, so even though the same routing decisions, the same token shards, and the same decoded states recur, it cannot say so.
+On the right, a block-scoped runtime treats the diffusion block as a single \emph{execution epoch}: it plans the stable structure once at block start, executes the iterations against that plan with sparse fast paths, and invalidates the plan when the next block begins.
+The figure pulls the three observations together because each redundancy now becomes visible to the planner.
+
+\begin{figure*}[t]
+\centering
+\figbox{Figure 6 visual plan: forward-scoped vs block-scoped execution.}{
+Two panels side-by-side.  \textbf{Left panel} (``Forward-scoped runtime''): four small column-iterations labelled Forward~1, Forward~2, Forward~3, Forward~$T$, with a faded ``$\ldots$'' between Forward~3 and Forward~$T$ to suggest many more.  Inside every column, three identical dense rows---``full routing'' (many blue expert edges), ``all tokens'' (mixed green \mask{} + grey \decoded{}, both sent through), ``dense communication'' (thick orange arrows).  The visual point is repetition.  Add a side label ``no block memory; per-forward rediscovery''.  \textbf{Right panel} (``Block-scoped Epoch''): one big rounded rectangle labelled ``Diffusion block = execution epoch''.  Inside, left-to-right: a blue ``cold plan at block start'' box, a middle region containing several thin hot iterations (each row much sparser than the dense version on the left, with pruned blue expert edges, grey decoded tokens bypassing, and orange arrows only on green tokens), and a right-side ``invalidate'' box at block end.  Central callout above both panels: ``Plan once per block; execute sparsely across iterations.''  Use the same visual vocabulary as Figures~3--5 so the reader sees the redundancies disappear here, not new ones appear.}
+\caption{The diffusion block exposes structure that is invisible to per-forward execution.  \sys{} turns the block into the execution unit and propagates block-scoped sparsity across every operator that previously saw dense work.}
+\label{fig:abstraction}
+\end{figure*}
+
+\sys{} treats each diffusion block as an execution epoch with three phases: a planning phase at the block boundary, a sequence of hot iterations that execute against the plan, and an invalidation step when the next block begins.
+The planner is the central abstraction.
+It partitions execution state into three classes whose lifetimes differ by orders of magnitude:
+\emph{block-stable state} (active expert support, layout metadata) is built once at block start and reused for every iteration in the block;
+\emph{iteration-varying state} (the local \mask{} set, the compact dispatch indices, the per-rank live sizes) is recomputed every iteration but cheap to derive;
+and \emph{fresh numerical values} (gate logits, expert outputs for \mask{} tokens) are computed from scratch every iteration on the values that flow into a decode decision.
+The first class is what \sys{} caches.
+The third class is what \sys{} guarantees never to cache.
+The second class is the bookkeeping that lets the runtime apply the first to the third.
+
+\begin{figure*}[t]
+\centering
+\figbox{Figure 7 visual plan: \sys{} system overview.}{
+Left-to-right pipeline.  Block input arrives on the far left and feeds a blue ``cold planner'' control plane that sits above the data path; the planner produces four labelled outputs (expert plan $S_l$, SP ownership, $\mathit{mask}_{sp}$, $\mathit{moe\_cache}_l$).  Below the planner, the hot path repeats $L$ times: ``attention in SP layout'' $\to$ ``route within $S_l$'' $\to$ ``sparse dispatch'' $\to$ ``expert compute'' $\to$ ``sparse combine'' $\to$ ``cache merge''.  The dispatch and combine boxes use orange backgrounds.  After the decoder stack, the output path runs ``SP LM head'' $\to$ ``local threshold decode'' $\to$ ``compact decision gather''.  Use four arrow styles: blue dashed (planning metadata), green solid (live \mask{} tokens), grey solid (decoded cache), orange (communication).  Place a small legend in the bottom-right.}
+\caption{\sys{} propagates block-scoped sparsity across routing, token compute, communication, and output decoding.  The cold planner sits on a separate control plane; the hot path executes against its outputs.}
+\label{fig:overview}
+\end{figure*}
+
+\begin{figure}[t]
+\centering
+\figbox{Figure 8 visual plan: planner state and timeline.}{
+Two-tier figure.  \textbf{Top tier}: a planner box containing four sub-boxes, each tagged with its lifetime: (i) ``Expert plan: $S_l$'' tagged \emph{block-scoped}; (ii) ``Token plan: SP ownership, $\mathit{mask}_{sp}$'' tagged \emph{request-scoped + iteration-scoped}; (iii) ``Communication plan: compact indices, live sizes'' tagged \emph{iteration-scoped}; (iv) ``Cache/output plan: $\mathit{moe\_cache}_l$, LM head metadata'' tagged \emph{block-scoped}.  \textbf{Bottom tier}: a horizontal timeline from ``Block start'' to ``Block end'' with guard symbols at the boundaries.  Above the timeline, label each hot iteration with ``fresh logits + fresh \mask{} MoE + fresh decisions''; below it label what is reused (``$S_l$'', ``cache'', ``SP layout'').  Tiny legend: \emph{Reused: structure}; \emph{Updated: liveness}; \emph{Recomputed: values}.}
+\caption{Planner state has three lifetimes.  \sys{} reuses block-scoped structure, refreshes iteration-scoped bookkeeping, and recomputes every value that feeds a live decode decision.}
+\label{fig:planner}
+\end{figure}
+
+\subsection{Planner Contract}
+
+The planner enforces five rules that together define the correctness boundary of \sys{}'s block-scoped reuse.
+\textbf{(C1)} Every live \mask{} token receives fresh routing and fresh MoE computation in every iteration.
+\textbf{(C2)} A decoded position may use cached MoE outputs only after threshold decoding has committed it---that is, only after the position has left the direct decode-decision path.
+\textbf{(C3)} Expert Budget constrains the candidate support but never freezes gate logits; the gate is recomputed on every iteration and may select any subset within the planned support.
+\textbf{(C4)} The sequence-parallel layout change is an ownership transformation, not a tensor-semantics change; each operator still receives a tensor of the shape it expects.
+\textbf{(C5)} Sparse communication returns the full local tensor that the next layer expects, with fresh \mask{}-token outputs and cached decoded-token outputs merged at the combine boundary.
+
+This contract is intentionally conservative.
+It also makes the approximation boundary explicit.
+The decoded-token cache is not claimed to be bit-exact full-model execution---decoded states still influence other tokens through attention in subsequent layers, and we cannot prove a priori that those downstream effects are negligible.
+We instead validate this boundary empirically through end-to-end quality measurement (\S\ref{sec:eval-quality}).
+
+% ============================================================
+% Expert Budget
+% ============================================================
+\section{Expert Budget}
+\label{sec:expert-budget}
+
+Expert Budget plans the expert axis of the routing graph.
+It answers a single question at the start of each block: which experts will be needed to cover this block's routing mass?
+
+\subsection{Coverage-Driven Support Construction}
+
+For each MoE layer, the cold path profiles \emph{expanded} routing candidates---a superset of the experts that the gate would normally select---so that under-covered tokens have room to find missing mass.
+For every token, it records the candidate experts and their normalized weights, then constructs an active support $S_l$ with two properties: $S_l$ should cover enough routing mass for every token in the block, and $S_l$ should be substantially smaller than the full expert set.
+
+The construction proceeds in two stages.
+The first stage selects experts by aggregate routing weight, capturing the experts that are popular across the block.
+The second stage closes per-token coverage gaps: for each token whose routing mass within $S_l$ falls below a quality floor, the algorithm scores every missing expert by how much it would close that token's gap and how often it would be hit by other tokens, then admits the highest-scoring experts until either the coverage condition holds for a fraction $q$ of tokens or $S_l$ reaches the full expert set.
+
+\begin{lstlisting}[caption={Expert Budget builds a block-local expert support.},label={lst:expert-budget}]
+BuildExpertBudget(candidates, weights, floor, q):
+    S = most_popular_experts(candidates, weights)
+    while satisfied_tokens(S) < q:
+        for each expert e not in S:
+            score[e] = gap_closed_by(e) + hit_gain(e)
+        S.add(top_scoring_experts(score))
+    return S
+\end{lstlisting}
+
+\begin{figure}[t]
+\centering
+\figbox{Figure 9 visual plan: Expert Budget construction.}{
+Three stacked panels.  \textbf{Panel (a) ``Cold profiling''}: token nodes $t_1\ldots t_N$ on the left, expert nodes $e_1\ldots e_E$ on the right; weighted candidate edges with thickness proportional to routing weight; label ``expanded top-$k$ candidates''.  \textbf{Panel (b) ``Coverage-driven expansion''}: highlight a candidate support set $S$ in blue; show one under-covered token whose top-weight edges escape $S$; draw a dashed arrow adding the gap-closing expert into $S$; small callout: ``coverage($t$, $S$) $\geq$ floor $\cdot$ topK\_mass($t$)''.  \textbf{Panel (c) ``Hot routing within $S$''}: a later iteration; gate logits redrawn (the gate is fresh); experts outside $S$ faded out; the token still picks its top experts inside $S$.  Bottom-of-figure callout: ``Cache support, not output.  Fresh logits every iteration.''}
+\caption{Expert Budget builds a block-local routing plan.  It plans expert support, not expert outputs.}
+\label{fig:expert-budget}
+\end{figure}
+
+\subsection{Hot Routing Inside the Plan}
+
+During hot iterations, the router computes fresh gate logits, and the routing kernel intersects each token's candidate experts with the planned support $S_l$, masking out everything outside the plan; the token then selects its top-$k$ experts from this intersection.
+This preserves intra-block adaptivity: a token can still change which expert it selects from one iteration to the next, and the gate weights still reflect the current hidden state.
+What the plan removes is only the experts that the cold path determined would not contribute meaningfully to this block's routing mass---experts that, if selected, would carry too little weight to change the layer's output substantially.
+
+\begin{figure}[t]
+\centering
+\figbox{Figure 10 visual plan: plan cache vs result cache.}{
+Two columns side-by-side.  \textbf{Left column (``Unsafe result cache'')}: hidden state at iteration $i$ vs $i{+}1$ slightly different; cached MoE output reused unchanged; logits drift; red marker labelled ``wrong decode''.  \textbf{Right column (``\sys{} plan cache'')}: same expert support $S$ reused (in blue) but gate logits recomputed (fresh), \mask{}-token MoE output recomputed (fresh); green check labelled ``live decision stays fresh''.  Add a small inset table: rows ``Expert support / Gate logits / \mask{} MoE output / Decode decision''; columns ``Result cache (stale, unsafe)'' / ``\sys{} plan cache (reused / fresh / fresh / fresh)''.  Use red only on the unsafe side.}
+\caption{Caching MoE results changes the live decode path and breaks generation.  Caching the routing \emph{plan} preserves every value that feeds a decode decision.}
+\label{fig:plan-vs-cache}
+\end{figure}
+
+% ============================================================
+% Sparse Sequence Parallelism
+% ============================================================
+\section{Sparse Sequence Parallelism}
+\label{sec:sparse-sp}
+
+Sparse Sequence Parallelism plans the token axis.
+Its job is to make per-rank token liveness visible to the MoE runtime.
+
+\subsection{Avoiding Token Replication}
+
+Standard tensor-parallel execution often restores a full-token layout on every rank after attention by completing an all-reduce.
+This is convenient because it lets every following operator assume the full token set is local---but it is wasteful for MoE, whose routing and expert computation are intrinsically per-token operations that can run correctly on any partition of the token axis.
+
+\sys{} therefore treats the attention output as a layout boundary rather than a place to materialize the full token set.
+Instead of completing the all-reduce, the system stops at a reduce-scatter, leaving each rank with a sequence-parallel shard of the post-attention activations.
+The following MoE layer runs on that shard; element-wise operations, layer norms, and residuals all remain local to their shard; and attention is the only operator that gathers full context---and it does so only when it actually needs to.
+
+\begin{figure}[t]
+\centering
+\figbox{Figure 11 visual plan: sequence-parallel layout.}{
+Two horizontal rows, each showing four TP ranks as boxes.  \textbf{Top row (``Baseline'')}: each rank holds an identical full-token strip after attention's all-reduce, and runs MoE over all tokens---visually, every rank looks the same.  \textbf{Bottom row (``\sys{}'')}: attention output reduce-scatter leaves rank~0 with shard~A only, rank~1 with shard~B only, etc.; each rank runs MoE on its own shard---visually, the four ranks look distinct.  In between, a small equation: ``AllReduce $=$ ReduceScatter $+$ AllGather; \sys{} stops after ReduceScatter''.  Boldface label below: ``Exact layout transformation: ownership change, not tensor change.''}
+\caption{Sequence-parallel layout removes replicated token work before MoE.  This is an ownership transformation; every operator still receives a tensor of the shape it expects.}
+\label{fig:sp-layout}
+\end{figure}
+
+\subsection{Decision-Liveness Cache Merge}
+
+Each rank now sees its own token shard and can identify which of its local positions are still \mask{} in the current iteration.
+For \mask{} tokens, \sys{} computes fresh MoE outputs as in any standard runtime.
+For decoded positions, \sys{} reads the per-layer cache populated when those positions were last live.
+After the MoE layer completes, the two paths merge and the next operator receives a full local shard whose decoded entries reflect cached values and whose \mask{} entries reflect freshly computed values.
+
+\begin{lstlisting}[caption={Cache merge for one MoE layer.},label={lst:cache-merge}]
+mask_sp = local_tokens_are_mask(input_ids_sp)
+y_sp = moe_cache_l.clone()
+y_sp[mask_sp] = fresh_moe(hidden_sp[mask_sp])
+moe_cache_l = update_cache(y_sp)
+return y_sp
+\end{lstlisting}
+
+\begin{figure}[t]
+\centering
+\figbox{Figure 12 visual plan: decision liveness and cache merge.}{
+One rank's local shard.  Mixed strip of green \mask{} and grey \decoded{} tokens enters from the left.  Two branches diverge: green tokens go through ``fresh routing $\to$ sparse dispatch $\to$ expert compute $\to$ sparse combine'' (drawn with active orange arrows); grey tokens go through ``$\mathit{moe\_cache}_l$ read'' (a quiet grey path that bypasses communication entirely).  Both branches re-merge into a full local tensor on the right where every position is restored.  Warning callout above the merge: ``Decoded tokens stay in model state.  Only their fresh MoE output is skipped.''}
+\caption{Decoded positions are inactive on the direct decode-decision path, but they remain in the tensor state through cache merge so that downstream attention and residual computation stay correct.}
+\label{fig:liveness-cache}
+\end{figure}
+
+% ============================================================
+% Sparse Communication
+% ============================================================
+\section{Sparse Communication}
+\label{sec:sparse-comm}
+
+Per-rank sparse compute is necessary but not sufficient (Observation~3): expert-parallel collectives must themselves become sparse, or every byte of decoded-token state still crosses the network.
+\sys{} therefore reshapes dispatch and combine to operate on compact buffers of live tokens.
+
+\subsection{Sparse Dispatch}
+
+Before dispatch, each rank extracts the hidden states of its local \mask{} tokens together with their corresponding router logits.
+Because different ranks generally hold different numbers of live tokens, \sys{} pads every per-rank buffer to the maximum live count within the expert-parallel group, all-gathers the padded buffers, and then strips the padding to reconstruct a compact global buffer of live tokens.
+This pad-then-strip pattern keeps the underlying collective primitive size-uniform---which is what existing fused-MoE kernels expect---while the live-set logic stays at the runtime layer.
+
+\subsection{Null Expert}
+
+\sys{} represents decoded-token skip through a \emph{null expert}---not a real model expert with weights, but a runtime-only marker that maps to no computation and to no expert weights.
+A token routed to the null expert produces no output that the downstream pipeline will consume.
+This single trick keeps liveness inside the existing routing interface: the fused MoE kernel sees its usual expert-id input and skips entries whose id is the null expert, while the rest of the kernel stack is left untouched.
+The alternative---threading liveness checks through every expert kernel---would be both invasive and brittle as kernels evolve.
+
+\subsection{Sparse Combine}
+
+After expert computation completes, \sys{} extracts outputs only for live \mask{} tokens, splits and pads them by owner rank, and reduce-scatters the compact buffer back across the expert-parallel group.
+Each owner rank then unpads its result and merges fresh \mask{}-token outputs with cached values for its decoded positions, restoring the full local shard that the next layer expects (per contract C5).
+
+\begin{figure*}[t]
+\centering
+\figbox{Figure 13 visual plan: sparse dispatch and combine pipeline.}{
+Single horizontal pipeline for one MoE layer, left-to-right:
+$\text{hidden}_{sp}$ $\to$ ``extract \mask{} tokens'' (compact green tensor) $\to$ ``sparse dispatch across EP ranks'' (orange arrows, EP ranks shown as expert boxes) $\to$ ``expert compute'' $\to$ ``sparse combine'' (orange arrows, narrower) $\to$ ``cache merge'' (the grey decoded path joins back in here) $\to$ $\text{output}_{sp}$.  The grey decoded tokens explicitly bypass the orange communication arrows and re-enter at cache merge.  Inset showing per-rank live counts $n_{\mathrm{live}}(\text{rank})$ for each of four EP ranks, with a note ``pad to $\max_r n_{\mathrm{live}}$''.  Bottom inscription: ``Comm volume $\propto$ $\lvert$\mask{} tokens$\rvert$, not $\lvert$all tokens$\rvert$.''}
+\caption{Sparse dispatch and combine make expert-parallel communication proportional to the live \mask{} set.}
+\label{fig:sparse-comm}
+\end{figure*}
+
+\begin{figure}[t]
+\centering
+\figbox{Figure 14 visual plan: null expert.}{
+Real experts $e_0, e_1, \ldots, e_{E-1}$ drawn as solid blue/white boxes; one extra dashed grey box on the right labelled ``Null expert $e_E$'', tagged with ``$\mathit{expert\_map}[e_E] = -1$''.  Green \mask{} token arrows route to real experts; grey decoded token arrows route to the null expert and visibly disappear before the GEMM stage.  Below, a small note: ``cache merge overwrites null output''---decoded outputs come from $\mathit{moe\_cache}_l$, not from this kernel.}
+\caption{The null expert encodes decoded-token skip without changing the expert-kernel interface.  It is a runtime label, not a model parameter.}
+\label{fig:null-expert}
+\end{figure}
+
+% ============================================================
+% SP LM Head
+% ============================================================
+\section{Preserving Sparsity at the Output Boundary}
+
+Even with sparse compute and sparse communication, a conventional output path can reintroduce dense work.
+The standard sequence is: gather full hidden states across ranks, run the LM head over every position to materialize a dense $|V|$-dimensional logit vector per token, optionally cast that vector to higher precision, and only then decode.
+For a vocabulary of tens of thousands and a block of dozens of positions, this final stretch easily becomes one of the most expensive parts of the forward.
+
+\sys{} keeps the sequence-parallel layout intact through the LM head.
+Each rank computes logits only for its local token shard, runs the threshold decoder locally, and contributes only \emph{decisions}---compact token IDs and metadata---to the system-wide gather.
+Full logits are never materialized across ranks; the only thing the runtime needs at the global level is which positions decoded to which token, and that is what it gathers.
+
+\begin{figure}[t]
+\centering
+\figbox{Figure 15 visual plan: sequence-parallel LM head.}{
+Two rows, end-to-end output paths.  \textbf{Top row (``Baseline'')}: $\text{hidden}_{sp}$ $\to$ all-gather full hidden $\to$ full LM head $\to$ dense logits (a large red box labelled $[N, V]$) $\to$ \texttt{logits.float()} $\to$ decode.  \textbf{Bottom row (``\sys{}'')}: $\text{hidden}_{sp}$ $\to$ local LM head on the rank's token shard (small per-rank box labelled $[N_{sp}, V]$) $\to$ local threshold decode $\to$ gather \emph{token IDs} (a small compact bundle of size $O(N)$).  Centre callout in bold: ``Gather decisions, not logits.''}
+\caption{The output path preserves sparse layout until the semantic boundary---token decisions---and avoids materializing a vocabulary-sized logit tensor across ranks.}
+\label{fig:sp-lmhead}
+\end{figure}
+
+% ============================================================
+% Implementation
+% ============================================================
+\section{Implementation}
+
+We implement \sys{} on top of a dLLM MoE inference stack with vLLM-style fused MoE kernels and expert parallelism, deployed on 8 NVIDIA H100 GPUs in a configuration that combines tensor, expert, and data parallelism.
+The implementation extends the existing stack through five narrow hooks rather than rewriting the runtime:
+a \emph{block-boundary hook} that detects block start and end and triggers planning and invalidation;
+a \emph{routing hook} that applies the Expert Budget support mask before the gate selects top-$k$;
+an \emph{attention-layout hook} that stops at reduce-scatter to retain sequence-parallel shards after attention;
+a \emph{MoE communication wrapper} that performs sparse extraction, padded all-gather, sparse combine, null-expert handling, and cache merge;
+and an \emph{output hook} that runs the sequence-parallel LM head and gathers compact decisions in place of dense logits.
+
+\begin{figure}[t]
+\centering
+\figbox{Figure 16 visual plan: implementation hooks.}{
+Vertical decoder forward path drawn as a stacked column: block init $\to$ attention $\to$ router $\to$ MoE dispatch $\to$ expert kernel $\to$ combine $\to$ LM head $\to$ decode.  Five blue hook badges sit to the left of the column, each labelled and pointing into the relevant operator: (1) Block-boundary hook (init); (2) Routing hook (router); (3) Attention-layout hook (attention); (4) Sparse-communication wrapper (spans dispatch + combine); (5) Output decode hook (LM head + decode).  A small grey side-note next to ``expert kernel'' reads: ``existing fused MoE kernel intact''.  A small box on the right shows the planner's reused state $\{S_l, \mathit{moe\_cache}_l, \mathit{mask}_{sp}\}$ feeding into hooks (2), (3), and (4).}
+\caption{\sys{} integrates through five narrow runtime hooks; the existing fused MoE kernel is left intact.}
+\label{fig:impl-hooks}
+\end{figure}
+
+\subsection{Planner State}
+
+\begin{table}[t]
+\centering
+\caption{Planner state in \sys{}.}
+\label{tab:planner-state}
+\begin{tabular}{lll}
+\toprule
+State & Scope & Purpose \\
+\midrule
+$S_l$ & block, layer & active expert support \\
+SP ownership & request, rank & token-to-rank mapping \\
+$mask_{sp}$ & iteration, rank & local live-token mask \\
+$moe\_cache_l$ & block, layer, rank & decoded output cache \\
+Live indices & iteration, rank & compact dispatch indices \\
+Live sizes & iteration, EP group & sparse collective sizes \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Cold and Hot Paths}
+
+At each block boundary, \sys{} runs a short cold path: it clears per-block caches, initializes the \mask{} set, profiles routing candidates for every MoE layer, builds the Expert Budget supports $\{S_l\}$, and prepares sequence-parallel metadata.
+The cold path runs once per block and its cost is amortized across all hot iterations in that block.
+
+The hot path executes every iteration.
+It refreshes the local \mask{} set, computes fresh gate logits, routes inside the planned support, dispatches only live token states, computes fresh expert outputs for those tokens, combines the live outputs back to their owner ranks, merges them with cached decoded values, and decodes locally at the output boundary.
+
+\begin{lstlisting}[caption={Hot path for one block iteration.},label={lst:hotpath}]
+for each iteration i in block:
+    mask_sp = identify_local_mask_tokens(input_ids_sp)
+    live_sizes = all_gather_live_sizes(mask_sp)
+    for each MoE layer l:
+        logits = gate_l(hidden_sp)
+        route = route_with_support(logits, S_l)
+        live = hidden_sp[mask_sp]
+        fresh = sparse_moe(live, route, live_sizes)
+        hidden_sp = cache_merge(fresh, mask_sp, moe_cache_l)
+    decisions = local_lm_head_decode(hidden_sp)
+    input_ids_sp = gather_and_apply(decisions)
+\end{lstlisting}
+
+% ============================================================
+% Correctness
+% ============================================================
+\section{Correctness Boundary}
+
+\sys{}'s mechanisms split cleanly into exact layout transformations and constrained approximations, and we make this boundary explicit because it shapes how the system should be evaluated and trusted.
+
+The sequence-parallel layout change is exact.
+Each operator continues to receive a tensor of the shape it requires: attention gathers the full context wherever it needs it, per-token operators run on shards, and every layer's output has the same shape it would have had under the dense layout.
+The change is one of \emph{ownership}, not arithmetic.
+
+Expert Budget is not result caching.
+The router still computes fresh gate logits at every iteration, and \mask{}-token expert outputs are still computed from scratch; the cache only constrains \emph{which} experts are eligible to receive a token's mass.
+Whether this constraint perturbs end-to-end output is an empirical question that we answer in \S\ref{sec:eval-quality}.
+
+The decoded-token cache merge is the one place where \sys{} departs from bit-exact full-model execution.
+The departure is safe on the direct decode path---threshold decoding, by definition, never reconsults the logits of an already-decoded position---but decoded tokens still influence other positions through attention in subsequent layers.
+\sys{} preserves decoded token \emph{states} through the cache merge so that attention continues to see them, and we validate the resulting generation quality empirically rather than relying on a closed-form correctness argument.
+
+% ============================================================
+% Evaluation
+% ============================================================
+\section{Evaluation Methodology}
+
+We evaluate \sys{} on 8 NVIDIA H100 GPUs across three diffusion MoE models that span an order of magnitude in scale (Table~\ref{tab:models}).
+Our evaluation is organized around four questions: does block-scoped sparse execution translate into end-to-end speedup (\S\ref{sec:eval-e2e}); how much of that speedup comes from each mechanism (\S\ref{sec:eval-breakdown}); does it preserve generation quality (\S\ref{sec:eval-quality}); and how robust is the design to its own configuration (\S\ref{sec:eval-sensitivity})?
+
+\begin{table}[t]
+\centering
+\caption{Model set for the EuroSys evaluation.  Parameter counts follow the planned evaluation setup.}
+\label{tab:models}
+\begin{tabular}{llll}
+\toprule
+Model & Params & Role & Status \\
+\midrule
+LLaDA2.0-mini & 16B & primary prototype & measured \\
+LLaDA2.0-Flash & 100B & scale-up model & \resulttodo{run} \\
+LLaDA2.1-Flash & 100B & next-version model & \resulttodo{run} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Baselines}
+
+We compare against three baselines that isolate different parts of the design space.
+The \emph{dense baseline} is an optimized dLLM MoE runtime with fused MoE kernels, fused RMSNorm, and tuned attention; it is the strongest version of the existing per-forward execution model and is not a strawman.
+The \emph{token-skip baseline} adds decoded-token compute skipping but keeps dense expert communication; it isolates the contribution of sparse compute alone.
+The \emph{communication-only sparse baseline}, where it can be constructed for the configuration under test, adds sparse dispatch and combine but omits Expert Budget; it isolates the contribution of sparse communication alone.
+
+\subsection{Metrics}
+
+We report two families of metrics.
+\emph{Performance} metrics include latency per forward, generated tokens per second, end-to-end request latency, GPU utilization, MoE dispatch and combine payloads, expert-pair count, the live \mask{} ratio across iterations, and the routing-support overlap between iterations.
+\emph{Quality} metrics include task accuracy on standard benchmarks, exact-match rate, output divergence from the dense baseline, and iteration count---we treat quality as a first-class metric because a faster forward that requires more iterations to converge can erase its own speedup.
+
+% ============================================================
+\section{Evaluation}
+
+\subsection{End-to-End Speedup}
+\label{sec:eval-e2e}
+
+\begin{figure*}[t]
+\centering
+\figbox{Figure 17 visual plan: end-to-end waterfall.}{
+Horizontal waterfall chart on LLaDA2.0-mini.  Leftmost bar: ``optimized dense baseline'', dark grey, 76.4\,ms/fwd.  Then a sequence of coloured incremental bars: ``+ Expert Budget'' (blue), ``+ SP layout'' (green), ``+ decoded-token cache merge'' (green), ``+ sparse dispatch/combine'' (orange), ``+ SP LM head'' (orange).  Each bar shows the delta in ms/fwd.  Any small overhead (e.g.\ planner cost) is drawn as a small red upward bar.  Final dark-grey bar on the right: ``\sys{}'', 58.2\,ms/fwd, with a $1.31\times$ label above.  If the C3 measurement is incomplete at submission, draw the ``+ sparse dispatch/combine'' bar as hatched and mark ``pending''.}
+\caption{End-to-end speedup comes from preserving sparsity across multiple runtime boundaries; no single mechanism dominates.}
+\label{fig:waterfall}
+\end{figure*}
+
+On LLaDA2.0-mini, \sys{} reduces forward latency from 76.4\,ms to 58.2\,ms, a 1.31$\times$ speedup over an already-optimized dense baseline.
+The waterfall in Figure~\ref{fig:waterfall} attributes this speedup to the four mechanisms in turn---Expert Budget, sequence-parallel layout, decoded-token cache merge, sparse dispatch and combine, and the sequence-parallel LM head---showing that no single mechanism dominates and that block-scoped sparsity must be propagated end-to-end to be effective.
+\resulttodo{Replace this paragraph with measured numbers for LLaDA2.0-Flash and LLaDA2.1-Flash, and report end-to-end (per-request) speedup in addition to per-forward latency.}
+
+\begin{figure*}[t]
+\centering
+\figbox{Figure 18 visual plan: speedup across models.}{
+Grouped bars.  Three groups along the x-axis: ``LLaDA2.0-mini (16B)'', ``LLaDA2.0-Flash (100B)'', ``LLaDA2.1-Flash (100B)''.  Within each group, six bars in a fixed colour order: dense baseline (grey), $+$EB (blue), $+$SP (green), $+$SparseComm (orange), $+$SP LM Head (orange-2), full \sys{} (dark green).  Y-axis: normalized throughput vs.\ dense baseline (preferred); raw ms/fwd in numeric labels above bars.  Error bars from repeated runs.  Place the ``full \sys{}'' speedup label above each group.  Mark the two 100B groups as TBD until those experiments complete.}
+\caption{Speedup across three diffusion MoE models.  The final evaluation will show whether block-scoped planning scales from 16B to 100B.}
+\label{fig:model-speedup}
+\end{figure*}
+
+\subsection{Where Time Goes}
+\label{sec:eval-breakdown}
+
+\begin{figure*}[t]
+\centering
+\figbox{Figure 19 visual plan: component breakdown before / after.}{
+Stacked bars across configurations: dense, $+$EB, $+$SP, $+$SparseComm, full \sys{}.  Components in each bar (consistent ordering with Figure~\ref{fig:baseline-breakdown}): routing, dispatch, expert kernel, combine, attention, LM head, logits cast, cache merge, other.  One panel per model, or small multiples.  Highlight, with thin outlines or arrows over each bar, which mechanism shrinks which component: EB shrinks routing/expert work, SP shrinks token compute, SparseComm shrinks dispatch+combine, SP LM Head shrinks LM head + logits cast.}
+\caption{Component breakdown shows whether each mechanism removes the cost it targets.}
+\label{fig:component-breakdown}
+\end{figure*}
+
+\subsection{Quality}
+\label{sec:eval-quality}
+
+\begin{figure}[t]
+\centering
+\figbox{Figure 20 visual plan: quality preservation.}{
+Two or three side-by-side panels.  \textbf{(a) Task accuracy / exact match}: grouped bars showing dense baseline vs.\ \sys{} across the three models on standard benchmarks (e.g.\ GSM8K, MMLU, HumanEval, internal held-out prompts).  Confidence intervals visible.  Y-axis starts at $0$ unless explicitly labelled otherwise.  \textbf{(b) Output divergence}: line or bar of token-divergence rate from the dense baseline, broken out for ``EB only'', ``decoded cache only'', ``full \sys{}'', so the reader can see which mechanism contributes which divergence.  \textbf{(c) Iteration-count delta}: small bars centred at zero showing change in refinement iterations per block; this is essential because a per-forward speedup is lost if more iterations are needed.  Caption language strictly says ``no measurable loss under evaluated benchmarks''---never ``provably identical''.}
+\caption{\sys{} must preserve quality while it skips decision-inactive MoE work.  We report task accuracy, output divergence from the dense baseline, and iteration count side-by-side because per-forward speedup is meaningful only if iteration count does not regress.}
+\label{fig:quality}
+\end{figure}
+
+The quality evaluation is critical because the decoded-token cache merge departs from bit-exact full-model execution: \sys{} recomputes every value that feeds a live decode decision, but it does change the dense execution path for already-decoded positions, and those positions still influence other tokens through downstream attention.
+We therefore measure output-level quality directly, not as a derived statistic, and we report iteration count alongside task accuracy because a faster forward whose outputs require more iterations to converge can erase its own speedup at the request level.
+
+\subsection{Sensitivity}
+\label{sec:eval-sensitivity}
+
+\begin{figure*}[t]
+\centering
+\figbox{Figure 21 visual plan: sensitivity grid.}{
+$2 \times 3$ grid of plots, sweeping six parameters: (a) block size, (b) decode threshold, (c) quality\_floor, (d) $q_{\text{major}}$, (e) routing top-$k$, (f) batch size.  Each subplot shows two y-series: latency or speedup (blue line), and quality / divergence (red or orange line); use two y-axes if needed.  Mark the default configuration with a vertical dashed line.  Shade the safe operating region in light blue.  This figure is where reviewers check robustness, so it must not look cherry-picked.}
+\caption{Sensitivity analysis identifies when the block-scoped plan is useful and when it should expand or rebuild.}
+\label{fig:sensitivity}
+\end{figure*}
+
+\subsection{Why Other Directions Are Not Enough}
+
+\begin{figure}[t]
+\centering
+\figbox{Figure 22 visual plan: negative results and alternatives.}{
+Horizontal bar chart, x-axis: speedup over the optimized dense baseline (vertical line at $1.0\times$).  Bars (top to bottom): ``EPLB / load balancing'', ``CUDA Graph capture'', ``fp8 dispatch'', ``compute--communication overlap'', ``dense token-skip without sparse comm'', ``kernel autotuning'', ``full result cache''.  Use blue for modest improvement, grey for $\approx 1.0\times$, red for regression or quality failure.  Right of each bar, a short reason: ``memory-bound dampens it'', ``launch overhead already hidden'', ``cast overhead'', ``no overlap headroom'', ``dense collective bottleneck'', ``shape already near-optimal'', ``stale live values---quality fail''.  This figure exists to support the abstraction claim: per-forward optimizations cannot expose redundancy that lives across forwards.}
+\caption{Common per-forward optimizations do not address the block-scoped abstraction mismatch.  The missing piece is the execution unit, not the kernel.}
+\label{fig:negative-results}
+\end{figure}
+
+We include negative results because they sharpen the argument.
+Expert-load balancing helps little here because total expert-pair work, not its imbalance, dominates the cost.
+CUDA Graph capture helps little because launch overhead is already hidden by other in-flight work.
+Communication quantization can regress when the cast overhead exceeds the NVLink savings on the relevant message sizes.
+Stable result caching is fast but wrong: it hurts generation quality because it freezes values that feed live decode decisions.
+The collective lesson is that the missing piece is not a local kernel optimization but the execution unit itself---no per-forward optimization can recover the redundancy that lives across forwards within a block.
+
+% ============================================================
+% Discussion
+% ============================================================
+\section{Discussion}
+
+\subsection{Generality}
+
+\sys{}'s design transfers to any inference workload that satisfies three conditions.
+First, generation must proceed by block-local iterative refinement, so that there is a meaningful unit larger than a forward but smaller than a request.
+Second, token positions must move from \mask{} to decoded states under a monotonic or mostly monotonic policy, so that liveness has stable semantics for the duration of the block.
+Third, the model must contain MoE layers whose routing, expert compute, and expert communication account for a large fraction of forward time---otherwise the redundancy \sys{} eliminates is not the bottleneck.
+The mechanisms themselves do not depend on a specific expert count or topology: Expert Budget depends on routing-support stability, Sparse Sequence Parallelism on per-token MoE semantics, and Sparse Communication on token liveness being visible before dispatch.
+
+\subsection{Limitations}
+
+\sys{} assumes that decoded positions are not reconsidered by the threshold decoder.
+If a future decoder revises decoded tokens, the liveness rule changes and the cache merge becomes unsafe; the planner abstraction itself still applies, but the live set must be re-defined and the cache contract revisited.
+
+Sparse communication currently pads to the maximum live count within an expert-parallel group, which is simple to implement but wastes bandwidth under skew.
+Variable-size collectives, when stable kernels are available, would tighten this path further.
+
+Expert Budget is most effective when routing support is stable across a block.
+On workloads where routing is volatile---for example, very long blocks or extreme prompt diversity---the planner should respond by expanding the support or rebuilding it more frequently, trading some of the speedup for the routing-coverage guarantee.
+
+% ============================================================
+% Related Work
+% ============================================================
+\section{Related Work}
+
+\paragraph{LLM serving systems.}
+Modern LLM serving systems---vLLM~\cite{vllm}, SGLang~\cite{sglang}, and their descendants---have made enormous progress on per-step scheduling, KV-cache reuse, batching, paged memory, and disaggregated prefill~\cite{prefill-service}.
+These systems treat the forward pass as the atomic unit of work, which is the right choice for autoregressive decoding but is precisely the abstraction that hides the structure \sys{} exploits.
+\sys{} is complementary to this body of work: it does not change how individual forwards are scheduled or how memory is managed, but rather elevates a coarser unit---the diffusion block---to first-class status so that block-internal redundancy becomes visible.
+
+\paragraph{MoE serving and parallelism.}
+A large body of work optimizes MoE inference at the per-forward level: better expert dispatch and combine~\cite{moe}, fused MoE kernels, expert-load balancing, and improved expert-parallel collectives.
+These optimizations attack the cost of one forward; \sys{} attacks the cost of the \emph{redundancy across forwards} that emerges only inside a diffusion block.
+The two directions compose: \sys{} runs on top of fused MoE kernels and inherits their per-forward improvements while adding block-scoped sparsity above them.
+
+\paragraph{Diffusion language model inference.}
+Existing systems for dLLM inference have studied block diffusion mechanics and per-token skipping for decoded positions.
+\sys{} extends this line by addressing a structural mismatch these prior systems leave open: token-level skipping alone is undone by dense expert communication and dense LM-head logits, so any system that wants block-scoped sparsity to translate into measurable speedup must coordinate expert planning, token liveness, sparse collectives, and output decode---the combination this paper makes concrete.
+
+\paragraph{Trace-based execution and adaptive runtimes.}
+\sys{} structurally resembles a tracing JIT~\cite{flashattention}: a hot loop is observed and planned, fast paths execute against the plan, and a guard invalidates the plan when assumptions change.
+Here the hot loop is the diffusion block, the guard is the block boundary, and the plan is the union of expert support, token-rank ownership, and sparse-collective metadata.
+Casting block-scoped MoE planning in this language clarifies why \sys{}'s design rule---cache structure, recompute live values---is precisely the discipline that traditional tracing systems impose on numerical state.
+
+\paragraph{LoRA and adapter-based systems.}
+LoRA-fused MoE training and inference systems~\cite{lorafusion} optimize a different axis (low-rank adapters) and are orthogonal to \sys{}; the techniques can in principle compose with \sys{}'s block-scoped planning.
+
+% ============================================================
+\section{Conclusion}
+
+Diffusion language models change the shape of inference: a block of tokens is refined through many forwards over a fixed set of positions, and that repetition is invisible to a runtime built around the per-forward abstraction.
+\sys{} elevates the diffusion block to a first-class execution unit and propagates block-scoped sparsity across four runtime boundaries that previously forced dense work---expert planning, token-axis layout, expert-parallel communication, and output decoding---under a single discipline: cache stable execution structure, recompute every live value, and never let dense work creep back in at a downstream boundary.
+On 8 H100 GPUs, an early implementation of this design reduces forward latency on LLaDA2.0-mini by 1.31$\times$ over an already-optimized dense MoE baseline without measurable quality loss.
+We expect the same principles---and most of the same mechanisms---to apply to any inference workload built on iterative refinement over a fixed set of positions, of which dLLMs are likely only the first.
+
+\balance
+\bibliographystyle{ACM-Reference-Format}
+\begin{thebibliography}{9}
+
+\bibitem{vllm}
+Woosuk Kwon et al.
+Efficient Memory Management for Large Language Model Serving with PagedAttention.
+SOSP, 2023.
+
+\bibitem{sglang}
+Lianmin Zheng et al.
+SGLang: Efficient Execution of Structured Language Model Programs.
+2024.
+
+\bibitem{moe}
+William Fedus, Barret Zoph, and Noam Shazeer.
+Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity.
+JMLR, 2022.
+
+\bibitem{prefill-service}
+Ruoyu Qin et al.
+Prefill-as-a-Service: KVCache of Next-Generation Models Could Go Cross-Datacenter.
+2026.
+
+\bibitem{lorafusion}
+Zhanda Zhu et al.
+LoRAFusion: Efficient LoRA Fine-Tuning for LLMs.
+EuroSys, 2026.
+
+\bibitem{flashattention}
+Tri Dao et al.
+FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness.
+NeurIPS, 2022.
+
+\end{thebibliography}
+
+\appendix
+\section{Figure Map}
+
+This appendix lists all figures in the planned 22-figure manuscript, in the refined order, so that the figure plan stays explicit during writing and revision.
+
+\begin{enumerate}[leftmargin=1.4em]
+\item Block diffusion mechanics (Introduction, background workload illustration).
+\item Dense baseline component breakdown (Motivation, baseline cost).
+\item Routing-support stability heatmap (Motivation, Observation~1).
+\item \mask{} ratio over block iterations (Motivation, Observation~2).
+\item Dense communication waste (Motivation, Observation~3).
+\item Forward-scoped vs block-scoped execution (Insight; bridge into design).
+\item \sys{} system overview (Design Overview).
+\item Planner state and timeline (Design Overview).
+\item Expert Budget construction (Expert Budget).
+\item Plan cache vs result cache (Expert Budget / correctness contrast).
+\item Sequence-parallel layout (Sparse Sequence Parallelism).
+\item Decision liveness and cache merge (Sparse Sequence Parallelism).
+\item Sparse dispatch and combine pipeline (Sparse Communication).
+\item Null expert (Sparse Communication).
+\item Sequence-parallel LM head (Output boundary).
+\item Implementation hooks (Implementation).
+\item End-to-end waterfall (Evaluation).
+\item Speedup across three models (Evaluation).
+\item Component breakdown before / after (Evaluation).
+\item Quality and output divergence (Evaluation).
+\item Sensitivity grid (Evaluation).
+\item Negative results and alternatives (Evaluation).
+\end{enumerate}
+
+\end{document}
