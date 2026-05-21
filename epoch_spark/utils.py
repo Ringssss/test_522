@@ -107,87 +107,41 @@ def load_model_and_tokenizer(device="cuda:0", dtype=torch.bfloat16):
     return model, tokenizer, config
 
 
-def _direct_moe_forward(self, hidden_states, router_logits):
-    """Direct expert computation bypassing vLLM FusedMoE runtime.
+def _fused_moe_forward(self, hidden_states, router_logits):
+    """Fused MoE forward using vLLM's Triton kernel.
 
-    This gives us explicit control over which experts run and access to
-    intermediate activations — essential for the residency manager.
+    Routes tokens through grouped top-k, then executes via fused_experts_impl.
+    Stores routing info for downstream hooks/controllers.
     """
-    from config import NUM_EXPERTS, TOP_K, N_GROUP, TOPK_GROUP, MOE_INTERMEDIATE_SIZE
+    from triton_moe import fused_experts, grouped_topk
 
-    N, H = hidden_states.shape
-    device = hidden_states.device
+    topk_weights, topk_ids = grouped_topk(router_logits)
 
-    # Grouped routing (matches LLaDA2MoeGate logic)
-    scores = torch.sigmoid(router_logits.float())
-    group_size = NUM_EXPERTS // N_GROUP
-    grouped = scores.view(N, N_GROUP, group_size)
-    group_max = grouped.max(dim=2).values
-    _, top_groups = group_max.topk(TOPK_GROUP, dim=1)
+    output = fused_experts(
+        hidden_states, self.w13_weight, self.w2_weight,
+        topk_weights, topk_ids,
+    )
 
-    group_mask = torch.zeros(N, NUM_EXPERTS, device=device)
-    for g in range(TOPK_GROUP):
-        g_idx = top_groups[:, g]
-        starts = g_idx * group_size
-        for offset in range(group_size):
-            group_mask[torch.arange(N, device=device), starts + offset] = 1.0
-    masked_scores = scores * group_mask
-    topk_weights, topk_ids = masked_scores.topk(TOP_K, dim=1)
-
-    # Normalize weights
-    topk_weights = topk_weights / (topk_weights.sum(dim=1, keepdim=True) + 1e-8)
-
-    # w13_weight: [E, 2*I, H], w2_weight: [E, H, I]
-    w13 = self.w13_weight  # [256, 1024, 2048]
-    w2 = self.w2_weight    # [256, 2048, 512]
-    I = MOE_INTERMEDIATE_SIZE  # 512
-
-    output = torch.zeros(N, H, device=device, dtype=hidden_states.dtype)
-
-    active_experts = topk_ids.unique().tolist()
-    for eid in active_experts:
-        token_mask = (topk_ids == eid)  # [N, K]
-        token_has_expert = token_mask.any(dim=1)  # [N]
-        if not token_has_expert.any():
-            continue
-
-        idx = token_has_expert.nonzero(as_tuple=True)[0]
-        hs = hidden_states[idx]  # [n, H]
-
-        gate_up = hs @ w13[eid].T.to(hs.dtype)  # [n, 2*I]
-        gate_out = torch.nn.functional.silu(gate_up[:, :I])
-        up_out = gate_up[:, I:]
-        intermediate = gate_out * up_out  # [n, I]
-        expert_out = intermediate @ w2[eid].T.to(hs.dtype)  # [n, H]
-
-        # Get routing weight for this expert for these tokens
-        weight_positions = token_mask[idx]  # [n, K]
-        weights_for_expert = topk_weights[idx]  # [n, K]
-        expert_weight = (weights_for_expert * weight_positions.float()).sum(dim=1, keepdim=True)
-
-        output[idx] += expert_out * expert_weight.to(expert_out.dtype)
-
-    # Store routing info for hooks to access
     self._last_topk_ids = topk_ids
     self._last_topk_weights = topk_weights
-    self._last_active_experts = active_experts
+    self._last_active_experts = topk_ids.unique().tolist()
 
     return output
 
 
 def _patch_fused_moe_to_direct(model):
-    """Replace FusedMoE.forward with direct expert computation."""
+    """Replace FusedMoE.forward with fused Triton expert computation."""
     from vllm.model_executor.layers.fused_moe import FusedMoE
     count = 0
     for name, mod in model.named_modules():
         if isinstance(mod, FusedMoE):
-            mod.forward = lambda *a, _mod=mod, **kw: _direct_moe_forward(
+            mod.forward = lambda *a, _mod=mod, **kw: _fused_moe_forward(
                 _mod,
                 kw.get("hidden_states", a[0] if a else None),
                 kw.get("router_logits", a[1] if len(a) > 1 else None),
             )
             count += 1
-    print(f"[patch] Replaced {count} FusedMoE modules with direct expert forward")
+    print(f"[patch] Replaced {count} FusedMoE modules with fused Triton forward")
 
 
 _cached_vllm_cfg = None

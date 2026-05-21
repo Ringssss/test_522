@@ -1,0 +1,62 @@
+{
+  "bs1": {
+    "baseline": {
+      "avg_ms": 42.27,
+      "throughput_tps": 75.7,
+      "peak_mem_mb": 31373.0,
+      "n_forwards": 40
+    },
+    "epoch_spark": {
+      "avg_ms": 37.96,
+      "throughput_tps": 84.3,
+      "peak_mem_mb": 31389.0,
+      "speedup": 1.11,
+      "cached_pct": 0.0,
+      "n_forwards": 40
+    },
+    "quality": {
+      "exact_match": "1/1",
+      "token_match_pct": 100.0
+    }
+  },
+  "bs16": {
+    "baseline": {
+      "avg_ms": 54.32,
+      "throughput_tps": 942.6,
+      "peak_mem_mb": 36416.0,
+      "n_forwards": 40
+    },
+    "epoch_spark": {
+      "avg_ms": 40.77,
+      "throughput_tps": 1255.8,
+      "peak_mem_mb": 36650.0,
+      "speedup": 1.33,
+      "cached_pct": 0.0,
+      "n_forwards": 40
+    },
+    "quality": {
+      "exact_match": "16/16",
+      "token_match_pct": 100.0
+    }
+  },
+  "bs64": {
+    "baseline": {
+      "avg_ms": 137.78,
+      "throughput_tps": 1486.4,
+      "peak_mem_mb": 52738.0,
+      "n_forwards": 40
+    },
+    "epoch_spark": {
+      "avg_ms": 133.76,
+      "throughput_tps": 1531.1,
+      "peak_mem_mb": 53486.0,
+      "speedup": 1.03,
+      "cached_pct": 0.0,
+      "n_forwards": 40
+    },
+    "quality": {
+      "exact_match": "64/64",
+      "token_match_pct": 100.0
+    }
+  }
+}

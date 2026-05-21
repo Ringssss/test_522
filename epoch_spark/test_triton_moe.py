@@ -1,47 +1,57 @@
 #!/usr/bin/env python3
-"""Quick test of Triton MoE kernel."""
-import sys; sys.path.insert(0, '.')
-import torch, time
+"""Test fused MoE kernel correctness and performance."""
+import sys, time
+sys.path.insert(0, '.')
+import torch
+from triton_moe import fused_experts, grouped_topk
 
-from utils import load_model_and_tokenizer, gpu_mem_mb
-from triton_moe import fused_experts_triton, grouped_topk
+E, N, K = 256, 512, 2048
+w1 = torch.randn(E, 2*N, K, dtype=torch.bfloat16, device='cuda:0') * 0.01
+w2 = torch.randn(E, K, N, dtype=torch.bfloat16, device='cuda:0') * 0.01
 
-model, tokenizer, config = load_model_and_tokenizer(device='cuda:0')
-print(f'Model loaded, GPU: {gpu_mem_mb(0):.0f} MB')
+print("=== Correctness ===")
+for M in [32, 512, 2048]:
+    hs = torch.randn(M, K, dtype=torch.bfloat16, device='cuda:0')
+    rl = torch.randn(M, E, dtype=torch.bfloat16, device='cuda:0')
+    topk_w, topk_ids = grouped_topk(rl, num_experts=E)
 
-moe_block = None
-for name, mod in model.named_modules():
-    if mod.__class__.__name__ == 'LLaDA2MoeSparseMoeBlock':
-        moe_block = mod
-        break
+    out_fused = fused_experts(hs, w1, w2, topk_w, topk_ids)
 
-w13 = moe_block.experts.w13_weight
-w2 = moe_block.experts.w2_weight
-print(f'w13: {w13.shape}, w2: {w2.shape}')
+    # Reference: naive expert loop
+    out_ref = torch.zeros_like(hs)
+    for eid in topk_ids.unique().tolist():
+        mask = (topk_ids == eid)
+        has = mask.any(dim=1)
+        if not has.any():
+            continue
+        idx = has.nonzero(as_tuple=True)[0]
+        h = hs[idx].float()
+        gate_up = h @ w1[eid].T.float()
+        gate = torch.nn.functional.silu(gate_up[:, :N])
+        up = gate_up[:, N:]
+        eo = (gate * up) @ w2[eid].T.float()
+        ew = (topk_w[idx] * mask[idx].float()).sum(dim=1, keepdim=True)
+        out_ref[idx] += (eo * ew).to(out_ref.dtype)
 
-# Test correctness
-N, H = 32, 2048
-hs = torch.randn(N, H, dtype=torch.bfloat16, device='cuda:0')
-rl = torch.randn(N, 256, dtype=torch.bfloat16, device='cuda:0')
-topk_w, topk_ids = grouped_topk(rl)
-print(f'topk_ids: {topk_ids.shape}, topk_w: {topk_w.shape}')
+    diff = (out_fused.float() - out_ref.float()).abs()
+    rel = diff.max() / (out_ref.float().abs().max() + 1e-8)
+    print(f"  M={M:4d}: abs_err={diff.max():.6f} rel_err={rel:.6f}")
 
-out = fused_experts_triton(hs, w13, w2, topk_w, topk_ids)
-print(f'Output: {out.shape}, norm: {out.float().norm():.4f}')
+print("\n=== Benchmark ===")
+for M in [32, 128, 512, 1024, 2048]:
+    hs = torch.randn(M, K, dtype=torch.bfloat16, device='cuda:0')
+    rl = torch.randn(M, E, dtype=torch.bfloat16, device='cuda:0')
+    topk_w, topk_ids = grouped_topk(rl, num_experts=E)
 
-# Benchmark
-for N in [32, 512, 2048]:
-    hs = torch.randn(N, H, dtype=torch.bfloat16, device='cuda:0')
-    rl = torch.randn(N, 256, dtype=torch.bfloat16, device='cuda:0')
-    topk_w, topk_ids = grouped_topk(rl)
-    for _ in range(3):
-        fused_experts_triton(hs, w13, w2, topk_w, topk_ids)
+    for _ in range(5):
+        fused_experts(hs, w1, w2, topk_w, topk_ids)
     torch.cuda.synchronize()
+
     t0 = time.perf_counter()
-    for _ in range(10):
-        fused_experts_triton(hs, w13, w2, topk_w, topk_ids)
+    for _ in range(20):
+        fused_experts(hs, w1, w2, topk_w, topk_ids)
     torch.cuda.synchronize()
-    ms = (time.perf_counter() - t0) / 10 * 1000
-    print(f'N={N:4d}: triton {ms:.2f} ms')
+    ms = (time.perf_counter() - t0) / 20 * 1000
+    print(f"  M={M:4d}: {ms:.2f} ms")
 
-print('DONE')
+print("DONE")
