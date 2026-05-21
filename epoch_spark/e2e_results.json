@@ -1,0 +1,9 @@
+{
+  "epoch_spark": {
+    "avg_forward_ms": 8927.78848449234,
+    "total_forwards": 32,
+    "gpu_budget": 80,
+    "avg_gpu_hit_rate": 0.7250913061460627,
+    "avg_gpu_cache_mb": 9120.0
+  }
+}
