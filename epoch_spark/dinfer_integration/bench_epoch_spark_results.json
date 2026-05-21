@@ -1,0 +1,65 @@
+{
+  "bs1": {
+    "baseline": {
+      "avg_ms": 125.83,
+      "tps": 23.7,
+      "n_fwd": 43,
+      "peak_mb": 31436.0
+    },
+    "epoch_spark": {
+      "avg_ms": 169.14,
+      "tps": 15.1,
+      "n_fwd": 50,
+      "peak_mb": 31450.0,
+      "speedup": 0.74,
+      "cached_pct": 64.7
+    },
+    "quality": {
+      "exact_match": "1/1"
+    },
+    "sample_base": "Please solve the following problems step by step.\n\nProblem 1: A train travels from City A to City B at 80 km/h and returns at 60 km/h. The total distance between the two cities is 240 km. What is the average speed for the entire round trip??00000000000000000000000000000000000000000000000000000000000",
+    "sample_es": "Please solve the following problems step by step.\n\nProblem 1: A train travels from City A to City B at 80 km/h and returns at 60 km/h. The total distance between the two cities is 240 km. What is the average speed for the entire round trip??00000000000000000000000000000000000000000000000000000000000"
+  },
+  "bs16": {
+    "baseline": {
+      "avg_ms": 69.49,
+      "tps": 230.3,
+      "n_fwd": 128,
+      "peak_mb": 33935.0
+    },
+    "epoch_spark": {
+      "avg_ms": 39.86,
+      "tps": 401.4,
+      "n_fwd": 128,
+      "peak_mb": 34149.0,
+      "speedup": 1.74,
+      "cached_pct": 0.0
+    },
+    "quality": {
+      "exact_match": "16/16"
+    },
+    "sample_base": "Please solve the following problems step by step.\n\nProblem 1: A train travels from City A to City B at 80 km/h and returns at 60 km/h. The total distance between the two cities is 240 km. What is the average speed for the entire round trip?\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",
+    "sample_es": "Please solve the following problems step by step.\n\nProblem 1: A train travels from City A to City B at 80 km/h and returns at 60 km/h. The total distance between the two cities is 240 km. What is the average speed for the entire round trip?\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n"
+  },
+  "bs64": {
+    "baseline": {
+      "avg_ms": 138.82,
+      "tps": 461.0,
+      "n_fwd": 128,
+      "peak_mb": 42473.0
+    },
+    "epoch_spark": {
+      "avg_ms": 128.55,
+      "tps": 497.9,
+      "n_fwd": 128,
+      "peak_mb": 43157.0,
+      "speedup": 1.08,
+      "cached_pct": 0.0
+    },
+    "quality": {
+      "exact_match": "64/64"
+    },
+    "sample_base": "Please solve the following problems step by step.\n\nProblem 1: A train travels from City A to City B at 80 km/h and returns at 60 km/h. The total distance between the two cities is 240 km. What is the average speed for the entire round trip?\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",
+    "sample_es": "Please solve the following problems step by step.\n\nProblem 1: A train travels from City A to City B at 80 km/h and returns at 60 km/h. The total distance between the two cities is 240 km. What is the average speed for the entire round trip?\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n"
+  }
+}
