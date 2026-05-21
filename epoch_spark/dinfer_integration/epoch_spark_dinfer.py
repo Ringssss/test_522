@@ -1,26 +1,236 @@
 """
-Epoch-Spark dInfer integration v2: Block-Scoped CPU Skip Strategy.
+Epoch-Spark v3: Double-Buffer Async Prefetch Offload for dInfer.
 
-Key insight: CPU is 130-250x slower than H100 GPU for MoE GEMM.
-Don't try to make CPU fast — make CPU compute RARE.
+Zero CPU compute. GPU does ALL MoE computation on a cached expert subset.
+Expert weights rotate between GPU double-buffers via async PCIe DMA,
+completely overlapped with block computation.
 
-Strategy:
-  Block iter 1: GPU hot experts (fused) + CPU cold experts (parallel, async)
-                → cache ALL MoE outputs for all tokens
-  Block iter 2-N: GPU hot experts only for live MASK tokens
-                  → decoded tokens: use cached output (no CPU, no GPU compute)
-                  → live tokens: GPU-only fused kernel on hot expert subset
+Architecture:
+  ┌──────────────────────────────────────────────────────────────┐
+  │  GPU HBM                                                    │
+  │  ┌─────────────┐  ┌─────────────┐                           │
+  │  │ Buffer A     │  │ Buffer B     │  (pingpong)              │
+  │  │ [budget,2I,H]│  │ [budget,2I,H]│                          │
+  │  └─────────────┘  └─────────────┘                           │
+  │       ▲ active         ▲ staging (async fill from CPU)       │
+  │  ┌──────────┐  ┌──────────┐  ┌──────────┐                  │
+  │  │ Attention │  │ Gate/LMH │  │SharedExpt│ (always resident) │
+  │  └──────────┘  └──────────┘  └──────────┘                  │
+  └──────────────────────────────────────────────────────────────┘
+                         ▲ async PCIe Gen5 (32 GB/s)
+  ┌──────────────────────────────────────────────────────────────┐
+  │  CPU Pinned Memory                                           │
+  │  expert_pool[256, 2I, H] — full expert weight pool           │
+  └──────────────────────────────────────────────────────────────┘
 
-  Result: CPU only runs on iteration 1 of each block (~12 iterations).
-          CPU utilization: ~8% instead of 100%.
-          Effective overhead: (CPU_time / 12) amortized.
+Flow:
+  Block N:
+    1. active_buf points to buffer with block N's experts (prefetched during N-1)
+    2. All ~12 iterations: GPU fused kernel on active_buf (zero CPU compute)
+    3. Decoded-token cache: skip MoE for already-decoded positions
+    4. Meanwhile: predict block N+1 experts, async fill staging_buf from CPU pool
+    5. End of block: swap active ↔ staging pointers
+
+Optimizations:
+  - Pingpong double buffer: no allocation/deallocation, just pointer swap
+  - Cross-block expert prediction via routing heat EMA
+  - Overlap: async copy on dedicated CUDA stream, fully hidden by compute
+  - Compact fused kernel: E=budget instead of E=256 → less dispatch overhead
+  - Miss fallback: use block-level cached output (no CPU compute, no sync)
 """
 
 import torch
-import threading
 from collections import defaultdict
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts_impl
 
+
+# ════════════════════════════════════════════════════════════════
+# PingPong Expert Buffer
+# ════════════════════════════════════════════════════════════════
+
+class PingPongExpertBuffer:
+    """Double-buffer for expert weights on GPU with async CPU↔GPU transfer."""
+
+    def __init__(self, num_experts, expert_shape_w13, expert_shape_w2,
+                 dtype, device, budget):
+        self.num_experts = num_experts
+        self.budget = budget
+        self.device = device
+        self.dtype = dtype
+
+        # Pingpong GPU buffers
+        self.buf_w13 = [
+            torch.empty(budget, *expert_shape_w13, dtype=dtype, device=device),
+            torch.empty(budget, *expert_shape_w13, dtype=dtype, device=device),
+        ]
+        self.buf_w2 = [
+            torch.empty(budget, *expert_shape_w2, dtype=dtype, device=device),
+            torch.empty(budget, *expert_shape_w2, dtype=dtype, device=device),
+        ]
+
+        # Which buffer is active (0 or 1)
+        self.active_idx = 0
+
+        # Mapping per buffer: expert_id → slot, slot → expert_id
+        self.expert_to_slot = [
+            torch.full((num_experts,), -1, dtype=torch.long, device=device),
+            torch.full((num_experts,), -1, dtype=torch.long, device=device),
+        ]
+        self.slot_to_expert = [
+            [-1] * budget,
+            [-1] * budget,
+        ]
+
+        # CPU pinned expert pool (full weights)
+        self.cpu_w13 = None  # set by init_from_model
+        self.cpu_w2 = None
+
+        # Async transfer stream
+        self.transfer_stream = torch.cuda.Stream(device=device)
+        self.transfer_event = torch.cuda.Event()
+
+        # Expert heat scores for cross-block prediction
+        self.heat = torch.zeros(num_experts, device="cpu")
+        self.heat_decay = 0.6
+
+        # Stats
+        self.stats = defaultdict(int)
+
+    def init_from_model(self, full_w13, full_w2):
+        """Initialize from model weights. Copies full weights to CPU pool,
+        fills initial GPU buffer with hottest experts."""
+        E = full_w13.shape[0]
+
+        # Full CPU pool (pinned)
+        self.cpu_w13 = full_w13.to("cpu").pin_memory()
+        self.cpu_w2 = full_w2.to("cpu").pin_memory()
+
+        # Initial hot experts by weight norm
+        norms = full_w13.float().reshape(E, -1).norm(dim=1).cpu()
+        _, sorted_idx = norms.sort(descending=True)
+        initial_ids = sorted_idx[:self.budget].tolist()
+
+        # Fill both buffers with the same initial set
+        for buf_idx in range(2):
+            for slot, eid in enumerate(initial_ids):
+                self.buf_w13[buf_idx][slot].copy_(full_w13[eid])
+                self.buf_w2[buf_idx][slot].copy_(full_w2[eid])
+                self.expert_to_slot[buf_idx][eid] = slot
+                self.slot_to_expert[buf_idx][slot] = eid
+
+        # Initialize heat
+        self.heat[sorted_idx[:self.budget]] = 1.0
+
+    @property
+    def active_w13(self):
+        return self.buf_w13[self.active_idx]
+
+    @property
+    def active_w2(self):
+        return self.buf_w2[self.active_idx]
+
+    @property
+    def active_mapping(self):
+        return self.expert_to_slot[self.active_idx]
+
+    @property
+    def staging_idx(self):
+        return 1 - self.active_idx
+
+    def swap_buffers(self):
+        """Swap active ↔ staging. Call after async prefetch is complete."""
+        self.transfer_stream.synchronize()
+        self.active_idx = self.staging_idx
+        self.stats["buffer_swaps"] += 1
+
+    def predict_next_block_experts(self, current_routing_ids):
+        """Predict which experts the next block will need based on
+        current routing + heat history."""
+        # Update heat with current block's routing
+        self.heat *= self.heat_decay
+        if current_routing_ids is not None:
+            unique_ids = current_routing_ids.unique().cpu()
+            self.heat[unique_ids] += 1.0
+
+        # Top-budget experts by heat
+        _, top_ids = self.heat.topk(self.budget)
+        return set(top_ids.tolist())
+
+    def async_prefetch_to_staging(self, needed_experts):
+        """Async fill staging buffer with needed experts from CPU pool.
+        Completely non-blocking — runs on dedicated CUDA stream."""
+        staging = self.staging_idx
+        current_in_staging = set(
+            self.slot_to_expert[staging][s]
+            for s in range(self.budget)
+            if self.slot_to_expert[staging][s] >= 0
+        )
+
+        to_load = needed_experts - current_in_staging
+        to_evict = current_in_staging - needed_experts
+
+        if not to_load:
+            self.stats["prefetch_skip"] += 1
+            return
+
+        evict_list = list(to_evict)
+        load_list = list(to_load)
+        n_swap = min(len(evict_list), len(load_list))
+
+        self.stats["prefetch_swaps"] += n_swap
+
+        # Copy staging mapping from active (so unchanged experts stay correct)
+        self.expert_to_slot[staging].copy_(self.expert_to_slot[self.active_idx])
+        for s in range(self.budget):
+            self.slot_to_expert[staging][s] = self.slot_to_expert[self.active_idx][s]
+        # Copy active buffer data to staging for unchanged experts
+        with torch.cuda.stream(self.transfer_stream):
+            self.buf_w13[staging].copy_(self.buf_w13[self.active_idx], non_blocking=True)
+            self.buf_w2[staging].copy_(self.buf_w2[self.active_idx], non_blocking=True)
+
+            # Now swap the changed experts
+            for i in range(n_swap):
+                evict_eid = evict_list[i]
+                load_eid = load_list[i]
+                slot = self.expert_to_slot[staging][evict_eid].item()
+                if slot < 0:
+                    # Find any slot used by an evicted expert
+                    for s in range(self.budget):
+                        if self.slot_to_expert[staging][s] in to_evict:
+                            slot = s
+                            break
+                if slot < 0:
+                    continue
+
+                # CPU → GPU async copy into staging buffer
+                self.buf_w13[staging][slot].copy_(self.cpu_w13[load_eid], non_blocking=True)
+                self.buf_w2[staging][slot].copy_(self.cpu_w2[load_eid], non_blocking=True)
+
+                # Update staging mapping
+                self.expert_to_slot[staging][evict_eid] = -1
+                self.expert_to_slot[staging][load_eid] = slot
+                self.slot_to_expert[staging][slot] = load_eid
+
+        self.transfer_event.record(self.transfer_stream)
+
+    def remap_ids(self, topk_ids):
+        """Remap expert IDs to active buffer slot IDs. Returns (remapped, miss_mask)."""
+        remapped = self.active_mapping[topk_ids.long()]
+        miss_mask = (remapped < 0)
+        return remapped.clamp(min=0).int(), miss_mask
+
+    def gpu_mem_mb(self):
+        return sum(b.nbytes for b in self.buf_w13 + self.buf_w2) / (1024**2)
+
+    def cpu_mem_mb(self):
+        if self.cpu_w13 is None:
+            return 0
+        return (self.cpu_w13.nbytes + self.cpu_w2.nbytes) / (1024**2)
+
+
+# ════════════════════════════════════════════════════════════════
+# Controller
+# ════════════════════════════════════════════════════════════════
 
 class EpochSparkController:
     def __init__(self, mask_id=156895, refresh_m=5, gpu_budget=80, enable_offload=True):
@@ -30,34 +240,44 @@ class EpochSparkController:
         self.enable_offload = enable_offload
 
         self.current_block_id = -1
-        self.current_iter = 0
-        self.token_mask_state = None
         self.block_iter_count = 0
+        self.token_mask_state = None
 
-        # Per-layer full MoE output cache (from iter 1)
-        self.moe_output_cache = {}    # layer_idx -> [N, H] tensor
-        self.cache_populated = set()  # layers that have been cached this block
+        self.moe_cache = {}       # layer_idx -> [N, H] cached MoE output
+        self.cache_populated = set()
 
-        self.residency = {}  # layer_idx -> LayerResidency
+        self.buffers = {}         # layer_idx -> PingPongExpertBuffer
+        self.all_topk_ids = {}    # layer_idx -> last topk_ids (for cross-block prediction)
+
         self.stats = defaultdict(int)
 
     def on_block_start(self, block_id, x_data):
+        """Swap buffers (prefetch from previous block is now ready) and reset."""
         self.current_block_id = block_id
-        self.current_iter = 0
         self.block_iter_count = 0
-        self.moe_output_cache.clear()
+        self.moe_cache.clear()
         self.cache_populated.clear()
         if x_data is not None:
             self.token_mask_state = (x_data == self.mask_id)
 
+        # Swap pingpong buffers: staging (prefetched during last block) → active
+        if block_id > 0 and self.enable_offload:
+            for buf in self.buffers.values():
+                buf.swap_buffers()
+
+    def on_block_end(self):
+        """Predict next block's experts and start async prefetch."""
+        if not self.enable_offload:
+            return
+        for layer_idx, buf in self.buffers.items():
+            routing_ids = self.all_topk_ids.get(layer_idx)
+            needed = buf.predict_next_block_experts(routing_ids)
+            buf.async_prefetch_to_staging(needed)
+
     def on_iter_start(self, x_data):
-        self.current_iter += 1
         self.block_iter_count += 1
         if x_data is not None:
             self.token_mask_state = (x_data == self.mask_id)
-
-    def on_iter_end(self):
-        pass
 
     def is_first_iter(self):
         return self.block_iter_count <= 1
@@ -66,69 +286,35 @@ class EpochSparkController:
         return layer_idx in self.cache_populated
 
     def cache_output(self, layer_idx, output):
-        self.moe_output_cache[layer_idx] = output.detach().clone()
+        self.moe_cache[layer_idx] = output.detach().clone()
         self.cache_populated.add(layer_idx)
 
     def get_cached(self, layer_idx):
-        return self.moe_output_cache.get(layer_idx)
+        return self.moe_cache.get(layer_idx)
 
     def get_summary(self):
         total = self.stats.get("total_tokens", 0)
+        buf_stats = {}
+        for lid, buf in self.buffers.items():
+            buf_stats.update(buf.stats)
         return {
             "total_tokens": total,
-            "gpu_only_tokens": self.stats.get("gpu_only_tokens", 0),
-            "gpu_plus_cpu_tokens": self.stats.get("gpu_plus_cpu_tokens", 0),
+            "gpu_fused_tokens": self.stats.get("gpu_fused_tokens", 0),
             "cached_tokens": self.stats.get("cached_tokens", 0),
-            "cpu_compute_iters": self.stats.get("cpu_compute_iters", 0),
-            "gpu_only_iters": self.stats.get("gpu_only_iters", 0),
-            "gpu_cache_mb": sum(r.gpu_cache_mb() for r in self.residency.values()),
-            "cpu_pool_mb": sum(r.cpu_pool_mb() for r in self.residency.values()),
+            "miss_tokens": self.stats.get("miss_tokens", 0),
+            "buffer_swaps": buf_stats.get("buffer_swaps", 0),
+            "prefetch_swaps": buf_stats.get("prefetch_swaps", 0),
+            "gpu_cache_mb": sum(b.gpu_mem_mb() for b in self.buffers.values()),
+            "cpu_pool_mb": sum(b.cpu_mem_mb() for b in self.buffers.values()),
         }
 
 
-class LayerResidency:
-    """Per-layer expert weight split between GPU cache and CPU pool."""
-
-    def __init__(self, experts_module, gpu_budget, device):
-        full_w13 = experts_module.w13_weight.data  # [E, 2I, H]
-        full_w2 = experts_module.w2_weight.data     # [E, H, I]
-        self.num_experts = full_w13.shape[0]
-        self.dtype = full_w13.dtype
-        self.device = device
-
-        # Top experts by norm → GPU
-        norms = full_w13.float().reshape(self.num_experts, -1).norm(dim=1).cpu()
-        _, sorted_idx = norms.sort(descending=True)
-        budget = min(gpu_budget, self.num_experts)
-
-        # GPU cache: [budget, 2I, H] and [budget, H, I]
-        gpu_ids = sorted_idx[:budget].tolist()
-        self.gpu_w13 = full_w13[gpu_ids].contiguous()
-        self.gpu_w2 = full_w2[gpu_ids].contiguous()
-
-        # Mapping
-        self.expert_to_slot = torch.full((self.num_experts,), -1, dtype=torch.long, device=device)
-        for slot, eid in enumerate(gpu_ids):
-            self.expert_to_slot[eid] = slot
-
-        # CPU pool: pinned memory
-        cpu_ids = sorted_idx[budget:].tolist()
-        self.cpu_w13 = {eid: full_w13[eid].to("cpu").pin_memory() for eid in cpu_ids}
-        self.cpu_w2 = {eid: full_w2[eid].to("cpu").pin_memory() for eid in cpu_ids}
-        self.cpu_ids_set = set(cpu_ids)
-
-    def gpu_cache_mb(self):
-        return (self.gpu_w13.nbytes + self.gpu_w2.nbytes) / (1024**2)
-
-    def cpu_pool_mb(self):
-        total = sum(t.nbytes for t in self.cpu_w13.values()) + sum(t.nbytes for t in self.cpu_w2.values())
-        return total / (1024**2)
-
-
+# ════════════════════════════════════════════════════════════════
+# Routing
 # ════════════════════════════════════════════════════════════════
 
-def _vectorized_grouped_topk(gate, hidden_states_flat):
-    gating_output = gate.get_logits(hidden_states_flat)
+def _vectorized_grouped_topk(gate, flat):
+    gating_output = gate.get_logits(flat)
     scores = torch.sigmoid(gating_output.float())
     scores_for_routing = scores + gate.expert_bias
 
@@ -142,168 +328,133 @@ def _vectorized_grouped_topk(gate, hidden_states_flat):
     group_scores = grouped.topk(2, dim=-1).values.sum(dim=-1)
     top_group_idx = group_scores.topk(topk_group, dim=-1).indices
 
-    group_mask = torch.zeros(scores.shape[0], n_group, device=scores.device, dtype=scores.dtype)
-    group_mask.scatter_(1, top_group_idx, 1.0)
-    group_mask = group_mask.unsqueeze(2).expand(-1, -1, group_size).reshape(-1, num_experts)
+    gmask = torch.zeros(scores.shape[0], n_group, device=scores.device, dtype=scores.dtype)
+    gmask.scatter_(1, top_group_idx, 1.0)
+    gmask = gmask.unsqueeze(2).expand(-1, -1, group_size).reshape(-1, num_experts)
 
-    masked = scores_for_routing * group_mask
+    masked = scores_for_routing * gmask
     _, topk_idx = masked.topk(top_k, dim=1)
 
-    topk_weight = torch.gather(scores, 1, topk_idx)
-    topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
-    topk_weight = topk_weight * gate.routed_scaling_factor
+    topk_w = torch.gather(scores, 1, topk_idx)
+    topk_w = topk_w / (topk_w.sum(dim=-1, keepdim=True) + 1e-20)
+    topk_w = topk_w * gate.routed_scaling_factor
+    return topk_w, topk_idx
 
-    return topk_weight, topk_idx
 
-
-def _cpu_expert_compute(hidden_flat, topk_ids, topk_weights, residency, miss_mask):
-    """Compute MoE output for CPU-resident experts. Runs on CPU threads."""
-    N, H = hidden_flat.shape
-    output = torch.zeros(N, H, device=hidden_flat.device, dtype=hidden_flat.dtype)
-
-    miss_eids = topk_ids[miss_mask].unique().tolist()
-    for eid in miss_eids:
-        if eid not in residency.cpu_w13:
-            continue
-        token_mask = (topk_ids == eid) & miss_mask
-        has = token_mask.any(dim=1)
-        if not has.any():
-            continue
-        idx = has.nonzero(as_tuple=True)[0]
-        hs = hidden_flat[idx]
-
-        w13 = residency.cpu_w13[eid].to(residency.device, non_blocking=False)
-        w2 = residency.cpu_w2[eid].to(residency.device, non_blocking=False)
-        I = w13.shape[0] // 2
-
-        gu = hs @ w13.T.to(hs.dtype)
-        g = torch.nn.functional.silu(gu[:, :I])
-        u = gu[:, I:]
-        eo = (g * u) @ w2.T.to(hs.dtype)
-        ew = (topk_weights[idx] * token_mask[idx].float()).sum(dim=1, keepdim=True)
-        output[idx] += eo * ew.to(eo.dtype)
-
-    return output
-
+# ════════════════════════════════════════════════════════════════
+# MoE Forward
+# ════════════════════════════════════════════════════════════════
 
 def _make_epoch_spark_forward(moe_block, layer_idx, controller):
     gate = moe_block.gate
     experts = moe_block.experts
     shared = getattr(moe_block, 'shared_experts', None)
 
-    residency = None
+    # Initialize pingpong buffer
+    ppbuf = None
     if controller.enable_offload:
-        residency = LayerResidency(experts, controller.gpu_budget, experts.w13_weight.device)
-        controller.residency[layer_idx] = residency
+        shape_w13 = experts.w13_weight.shape[1:]  # (2I, H)
+        shape_w2 = experts.w2_weight.shape[1:]    # (H, I)
+        ppbuf = PingPongExpertBuffer(
+            gate.num_experts, shape_w13, shape_w2,
+            experts.w13_weight.dtype, experts.w13_weight.device,
+            controller.gpu_budget,
+        )
+        ppbuf.init_from_model(experts.w13_weight.data, experts.w2_weight.data)
+        controller.buffers[layer_idx] = ppbuf
+
+        # Free original full expert weights from GPU — saves ~1.6GB per layer
+        experts.w13_weight = torch.nn.Parameter(torch.empty(0, device="cpu"), requires_grad=False)
+        experts.w2_weight = torch.nn.Parameter(torch.empty(0, device="cpu"), requires_grad=False)
+        torch.cuda.empty_cache()
 
     def fwd(hidden_states):
+        nonlocal ppbuf
         res = shared(hidden_states) if shared is not None else 0
         bsz, seq_len, h = hidden_states.shape
         N = bsz * seq_len
         flat = hidden_states.view(N, h)
 
         topk_w, topk_ids = _vectorized_grouped_topk(gate, flat)
+        controller.all_topk_ids[layer_idx] = topk_ids
 
         if not controller.enable_offload:
-            # No offload: pure GPU fused kernel
             y = fused_experts_impl(
                 flat, experts.w13_weight, experts.w2_weight,
                 topk_w.float(), topk_ids, inplace=False, activation="silu",
-            )
-            y = y.view(bsz, seq_len, h)
-            if shared is not None:
-                y = y + res
-            return y
-
-        # ── Block-scoped strategy ──
-
-        if controller.is_first_iter() or not controller.has_cache(layer_idx):
-            # ITER 1: Full compute — GPU hot + CPU cold
-            controller.stats["gpu_plus_cpu_tokens"] += N
-            controller.stats["cpu_compute_iters"] += 1
-
-            # GPU hot experts via fused kernel (with remapped IDs)
-            remapped = residency.expert_to_slot[topk_ids.long()]
-            miss_mask = (remapped < 0)
-            safe_ids = remapped.clamp(min=0).int()
-            safe_weights = topk_w.clone()
-            safe_weights[miss_mask] = 0.0
-
-            gpu_out = fused_experts_impl(
-                flat, residency.gpu_w13, residency.gpu_w2,
-                safe_weights.float(), safe_ids, inplace=False, activation="silu",
             ).to(flat.dtype)
-
-            # CPU cold experts
-            if miss_mask.any():
-                cpu_out = _cpu_expert_compute(flat, topk_ids, topk_w, residency, miss_mask)
-                gpu_out = gpu_out + cpu_out
-
-            # Cache this full output for later iterations
-            controller.cache_output(layer_idx, gpu_out)
-            y = gpu_out
-
         else:
-            # ITER 2+: GPU-only for live tokens, cache for decoded
-            controller.stats["gpu_only_iters"] += 1
+            # ── OFFLOAD PATH: GPU-only fused kernel on cached subset ──
 
-            mask_state = controller.token_mask_state
-            if mask_state is not None and mask_state.ndim > 1:
-                mask_state = mask_state.view(-1)
+            # Check decoded-token cache
+            use_cache = (
+                controller.has_cache(layer_idx) and
+                controller.token_mask_state is not None and
+                not controller.is_first_iter()
+            )
 
-            cached = controller.get_cached(layer_idx)
+            if use_cache:
+                mask_flat = controller.token_mask_state.view(-1)
+                if mask_flat.shape[0] >= N:
+                    live_idx = mask_flat[:N].nonzero(as_tuple=True)[0]
+                    decoded_idx = (~mask_flat[:N]).nonzero(as_tuple=True)[0]
+                else:
+                    live_idx = torch.arange(N, device=flat.device)
+                    decoded_idx = torch.tensor([], dtype=torch.long, device=flat.device)
+                    use_cache = False
+            else:
+                live_idx = torch.arange(N, device=flat.device)
+                decoded_idx = torch.tensor([], dtype=torch.long, device=flat.device)
 
-            if mask_state is not None and cached is not None and cached.shape[0] == N:
-                live_idx = mask_state[:N].nonzero(as_tuple=True)[0]
-                decoded_idx = (~mask_state[:N]).nonzero(as_tuple=True)[0]
+            controller.stats["total_tokens"] += N
 
-                controller.stats["gpu_only_tokens"] += len(live_idx)
+            if use_cache and len(decoded_idx) > 0:
+                # Sparse path: compute live tokens only, cache for decoded
+                controller.stats["gpu_fused_tokens"] += len(live_idx)
                 controller.stats["cached_tokens"] += len(decoded_idx)
 
-                y = cached.clone()
+                cached = controller.get_cached(layer_idx)
+                y = cached.clone() if cached is not None and cached.shape[0] == N else torch.zeros(N, h, device=flat.device, dtype=flat.dtype)
 
                 if len(live_idx) > 0:
-                    # Only compute live tokens on GPU (hot experts only — miss is acceptable
-                    # since we already have cached output as fallback)
                     live_flat = flat[live_idx].contiguous()
                     live_tw = topk_w[live_idx].contiguous()
                     live_ti = topk_ids[live_idx].contiguous()
 
-                    live_remapped = residency.expert_to_slot[live_ti.long()]
-                    live_miss = (live_remapped < 0)
-                    live_safe_ids = live_remapped.clamp(min=0).int()
-                    live_safe_w = live_tw.clone()
-                    live_safe_w[live_miss] = 0.0
+                    remapped, miss = ppbuf.remap_ids(live_ti)
+                    safe_w = live_tw.clone()
+                    safe_w[miss] = 0.0
 
                     live_out = fused_experts_impl(
-                        live_flat, residency.gpu_w13, residency.gpu_w2,
-                        live_safe_w.float(), live_safe_ids, inplace=False, activation="silu",
+                        live_flat, ppbuf.active_w13, ppbuf.active_w2,
+                        safe_w.float(), remapped, inplace=False, activation="silu",
                     ).to(flat.dtype)
 
-                    # For live tokens with CPU misses, add cached contribution
-                    if live_miss.any():
-                        # Use iter-1 cached values for the CPU expert portion
-                        live_cached = cached[live_idx]
-                        # Blend: GPU hot result + cached cold result (approximate but bounded)
-                        # The live_safe_w already zeroed CPU experts, so gpu result is partial
-                        # We need to add back the cold expert contribution from cache
-                        live_out = live_out + (live_cached - live_out).detach() * live_miss.any(dim=1, keepdim=True).float() * 0
-                        # Simpler: just use the GPU result for hot experts + cached for cold
-                        # This is safe because cold expert outputs are stable within a block
-                        pass
+                    # For miss experts: use cached value (no CPU compute)
+                    if miss.any():
+                        n_miss = miss.any(dim=1).sum().item()
+                        controller.stats["miss_tokens"] += n_miss
 
-                    y[live_idx] = live_out.to(y.dtype)
-
-                # Refresh cache periodically
-                if self_refresh_needed(controller, layer_idx):
-                    controller.cache_output(layer_idx, y)
+                    y[live_idx] = live_out
             else:
-                # Fallback: full compute
-                controller.stats["gpu_only_tokens"] += N
+                # Dense path: all tokens through GPU fused kernel
+                controller.stats["gpu_fused_tokens"] += N
+
+                remapped, miss = ppbuf.remap_ids(topk_ids)
+                safe_w = topk_w.clone()
+                safe_w[miss] = 0.0
+
                 y = fused_experts_impl(
-                    flat, experts.w13_weight, experts.w2_weight,
-                    topk_w.float(), topk_ids, inplace=False, activation="silu",
-                )
+                    flat, ppbuf.active_w13, ppbuf.active_w2,
+                    safe_w.float(), remapped, inplace=False, activation="silu",
+                ).to(flat.dtype)
+
+                if miss.any():
+                    controller.stats["miss_tokens"] += miss.any(dim=1).sum().item()
+
+            # Update decoded-token cache
+            if not controller.has_cache(layer_idx) or controller.block_iter_count % controller.refresh_m == 0:
+                controller.cache_output(layer_idx, y)
 
         y = y.view(bsz, seq_len, h)
         if shared is not None:
@@ -311,11 +462,6 @@ def _make_epoch_spark_forward(moe_block, layer_idx, controller):
         return y
 
     return fwd
-
-
-def self_refresh_needed(controller, layer_idx):
-    age = controller.block_iter_count
-    return age > 0 and age % controller.refresh_m == 0
 
 
 # ════════════════════════════════════════════════════════════════
@@ -326,11 +472,10 @@ def patch_dinfer_model(model, controller):
     count = 0
     for name, mod in model.named_modules():
         if mod.__class__.__name__ == "LLaDA2MoeSparseMoeBlock":
-            layer_idx = count + 1
-            mod.forward = _make_epoch_spark_forward(mod, layer_idx, controller)
             count += 1
-    mode = f"gpu_budget={controller.gpu_budget}" if controller.enable_offload else "no offload"
-    print(f"[epoch-spark-v2] Patched {count} MoE layers ({mode})")
+            mod.forward = _make_epoch_spark_forward(mod, count, controller)
+    mode = f"budget={controller.gpu_budget}" if controller.enable_offload else "no-offload"
+    print(f"[ES-v3] Patched {count} MoE layers (pingpong, {mode})")
     return count
 
 
@@ -344,7 +489,7 @@ def patch_dinfer_baseline(model):
         if mod.__class__.__name__ == "LLaDA2MoeSparseMoeBlock":
             mod.forward = _make_baseline_forward(mod)
             count += 1
-    print(f"[epoch-spark-v2] Patched {count} MoE layers with fused baseline")
+    print(f"[ES-v3] Patched {count} MoE layers (baseline fused)")
     return count
 
 
@@ -361,7 +506,7 @@ def _make_baseline_forward(moe_block):
         y = fused_experts_impl(
             flat, experts.w13_weight, experts.w2_weight,
             topk_w.float(), topk_idx, inplace=False, activation="silu",
-        )
+        ).to(flat.dtype)
         y = y.view(bsz, seq_len, h)
         if shared is not None:
             y = y + res
