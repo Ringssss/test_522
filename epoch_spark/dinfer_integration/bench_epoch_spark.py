@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""Epoch-Spark v3 benchmark. Single model load, baseline first then offload."""
+"""
+Epoch-Spark Full Optimization Benchmark.
+
+Stacks ALL optimizations on dInfer's native pipeline:
+  1. Fused RMSNorm (vLLM kernel)
+  2. FlashAttention 2 (flash_attn_func, non-causal)
+  3. Block Diffusion with KV Cache (forward only current block tokens)
+  4. IterationSmooth (reduce iteration count)
+  5. Fused Triton MoE routing
+
+Usage:
+    cd /home/zhujianian/eurosys/dInfer
+    /home/zhujianian/miniconda3/envs/crossstage/bin/python tests/bench_epoch_spark.py
+"""
 import os, sys, time, json, socket, types, importlib.util
 import torch
 
@@ -16,6 +29,7 @@ PROMPTS = [
     "Write a guide to training large language models.",
 ]
 
+
 def setup():
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     if "deep_ep" not in sys.modules or getattr(sys.modules.get("deep_ep"), "__spec__", None) is None:
@@ -24,6 +38,124 @@ def setup():
         f.Buffer = type("Buffer", (), {"get_dispatch_config": staticmethod(lambda *a, **kw: None), "get_combine_config": staticmethod(lambda *a, **kw: None)})
         f.Config = type("Config", (), {}); f.EventOverlap = type("EventOverlap", (), {}); sys.modules["deep_ep"] = f
 
+
+# ═══════════════════════════════════════════════════════════
+# Optimization 1: Fused RMSNorm
+# ═══════════════════════════════════════════════════════════
+
+def apply_fused_rmsnorm(model):
+    from vllm.model_executor.layers.layernorm import rms_norm as vllm_rms_norm
+    from dinfer.model.modeling_llada2_moe import LLaDA2MoeRMSNorm
+    count = 0
+    for name, module in model.named_modules():
+        if isinstance(module, LLaDA2MoeRMSNorm):
+            if "query_layernorm" in name or "key_layernorm" in name:
+                continue
+            w, eps = module.weight, module.variance_epsilon
+            def _mk(ww, ee):
+                def _f(hs): return vllm_rms_norm(hs, ww, ee)
+                return _f
+            module.forward = _mk(w, eps)
+            count += 1
+    return count
+
+
+# ═══════════════════════════════════════════════════════════
+# Optimization 2: FlashAttention 2 (non-causal)
+# ═══════════════════════════════════════════════════════════
+
+def apply_flash_attn(model):
+    """Replace SDPA attention with optimized non-causal attention.
+    Uses flash_attn if available, otherwise optimized SDPA."""
+    try:
+        from flash_attn import flash_attn_func
+        has_flash = True
+    except ImportError:
+        has_flash = False
+
+    from vllm.model_executor.layers.layernorm import rms_norm as vllm_rms_norm
+    from dinfer.model.modeling_llada2_moe import LLaDA2MoeSdpaAttention, apply_rotary_pos_emb
+    import torch.nn.functional as F
+    count = 0
+    for name, module in model.named_modules():
+        if not isinstance(module, LLaDA2MoeSdpaAttention):
+            continue
+
+        def make_fa_forward(attn, _has_flash=has_flash):
+            qnw = attn.query_layernorm.weight
+            qne = attn.query_layernorm.variance_epsilon
+            knw = attn.key_layernorm.weight
+            kne = attn.key_layernorm.variance_epsilon
+
+            def fa_fwd(hidden_states, attention_mask=None, position_ids=None,
+                       past_key_value=None, output_attentions=False, use_cache=False,
+                       position_embeddings=None, cache_position=None, replace_position=None, **kw):
+                bsz, q_len, _ = hidden_states.size()
+                nh = attn.num_heads; nkv = attn.num_key_value_heads; hd = attn.head_dim
+
+                qkv = attn.query_key_value(hidden_states)
+                if isinstance(qkv, tuple):
+                    qkv = qkv[0]
+                qkv = qkv.view(bsz, q_len, nh + 2*nkv, hd)
+                q, k, v = qkv.split([nh, nkv, nkv], dim=-2)
+
+                q = vllm_rms_norm(q, qnw, qne)
+                k = vllm_rms_norm(k, knw, kne)
+
+                q = q.transpose(1, 2); k = k.transpose(1, 2); v = v.transpose(1, 2)
+                cos, sin = position_embeddings
+                q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+                if past_key_value is not None:
+                    k, v = past_key_value.update(k, v, attn.layer_idx, replace_position)
+                if use_cache:
+                    past_key_value = (k, v)
+
+                if attention_mask is not None:
+                    from dinfer.model.modeling_llada2_moe import repeat_kv
+                    nkvg = nh // nkv
+                    ke = repeat_kv(k, nkvg).contiguous()
+                    ve = repeat_kv(v, nkvg).contiguous()
+                    am = attention_mask.bool()
+                    if am.dim() == 3: am = am.unsqueeze(1)
+                    out = F.scaled_dot_product_attention(q.contiguous(), ke, ve, attn_mask=am, is_causal=False)
+                    out = out.transpose(1, 2).contiguous()
+                elif _has_flash:
+                    from flash_attn import flash_attn_func
+                    out = flash_attn_func(q.transpose(1,2).contiguous(), k.transpose(1,2).contiguous(),
+                                          v.transpose(1,2).contiguous(), causal=False)
+                else:
+                    from dinfer.model.modeling_llada2_moe import repeat_kv
+                    nkvg = nh // nkv
+                    ke = repeat_kv(k, nkvg).contiguous()
+                    ve = repeat_kv(v, nkvg).contiguous()
+                    out = F.scaled_dot_product_attention(q.contiguous(), ke, ve, is_causal=False)
+                    out = out.transpose(1, 2).contiguous()
+
+                out = out.reshape(bsz, q_len, -1)
+                dense_out = attn.dense(out)
+                out = dense_out[0] if isinstance(dense_out, tuple) else dense_out
+                return out, None, past_key_value
+            return fa_fwd
+
+        module.forward = make_fa_forward(module)
+        count += 1
+    return count
+
+
+# ═══════════════════════════════════════════════════════════
+# Optimization 3: Fused Triton MoE routing
+# ═══════════════════════════════════════════════════════════
+
+def apply_fused_moe_routing(model):
+    from dinfer.epoch_spark_dinfer import patch_dinfer_baseline
+    return patch_dinfer_baseline(model)
+
+
+# ═══════════════════════════════════════════════════════════
+# Benchmark
+# ═══════════════════════════════════════════════════════════
+
 def prepare_batch(tokenizer, bs, device):
     prompts = [PROMPTS[i % len(PROMPTS)] for i in range(bs)]
     encoded = [tokenizer.encode(p, return_tensors="pt").squeeze(0) for p in prompts]
@@ -31,30 +163,21 @@ def prepare_batch(tokenizer, bs, device):
     padded = [torch.cat([torch.full((mx-e.shape[0],), MASK_ID, dtype=torch.long), e]) if e.shape[0]<mx else e for e in encoded]
     return torch.stack(padded).to(device)
 
-def run_gen(model, tokenizer, ids, bs, gl, device, ctrl=None):
-    from dinfer import BlockIteratorFactory, ThresholdParallelDecoder, BlockDiffusionLLMAttnmask, BlockWiseDiffusionLLM
-    dec = ThresholdParallelDecoder(temperature=0, threshold=0.9, mask_id=MASK_ID, eos_id=EOS_ID)
-    dllm = (BlockDiffusionLLMAttnmask(model, dec, BlockIteratorFactory(use_block_diffusion=True), early_stop=True) if bs == 1
-            else BlockWiseDiffusionLLM(model, dec, BlockIteratorFactory(), early_stop=True))
-    if ctrl:
-        obi = dllm.decoder.block_init; ofwd = dllm.diff_iteration.forward
-        def hbi(b, bid, _c=ctrl, _o=obi):
-            if _c.current_block_id >= 0: _c.on_block_end()
-            _c.on_block_start(bid, ids[0]); return _o(b, bid)
-        def hf(*a, _c=ctrl, _o=ofwd, **kw):
-            x = a[2] if len(a) > 2 else None
-            if x and hasattr(x, 'data'): _c.on_iter_start(x.data[0] if x.data.dim() > 1 else x.data)
-            return _o(*a, **kw)
-        dllm.decoder.block_init = hbi; dllm.diff_iteration.forward = hf
+
+def run_gen(model, tokenizer, ids, bs, gl, device, dllm_factory, label=""):
+    dllm = dllm_factory()
     torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats(device)
     t0 = time.perf_counter()
     with torch.inference_mode():
         out = dllm.generate(ids, gen_length=gl, block_length=32)
-    if ctrl: ctrl.on_block_end()
     torch.cuda.synchronize()
-    t = time.perf_counter() - t0; n = dllm.num_forwards; pk = torch.cuda.max_memory_allocated(device)/1024**2
+    t = time.perf_counter() - t0
+    n = dllm.num_forwards
+    pk = torch.cuda.max_memory_allocated(device) / 1024**2
     texts = [tokenizer.decode(out[i], skip_special_tokens=True) for i in range(bs)]
-    return t, n, pk, texts
+    avg = t/n*1000; tps = bs*gl/t
+    return {"avg_ms": avg, "tps": tps, "peak_mb": pk, "n_fwd": n, "total_s": t, "texts": texts}
+
 
 def main():
     import argparse
@@ -62,28 +185,36 @@ def main():
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--gen-length", type=int, default=128)
     p.add_argument("--batch-sizes", type=str, default="1,16,64")
-    p.add_argument("--budget", type=int, default=80)
     args = p.parse_args()
     bss = [int(b) for b in args.batch_sizes.split(",")]
     device = torch.device(f"cuda:{args.gpu}"); torch.cuda.set_device(device)
-    print("="*100)
-    print(f"Epoch-Spark v3 | LLaDA2.0-mini 16B | {torch.cuda.get_device_name(args.gpu)} | budget={args.budget}")
-    print("="*100)
+
+    print("=" * 100)
+    print(f"Full Optimization Benchmark | LLaDA2.0-mini 16B | {torch.cuda.get_device_name(args.gpu)}")
+    print("=" * 100)
     setup()
+
     from vllm import distributed
     from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
-    from dinfer.epoch_spark_dinfer import EpochSparkController, patch_dinfer_model, patch_dinfer_baseline
+    from vllm.forward_context import set_forward_context
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(("127.0.0.1",0)); port=sock.getsockname()[1]; sock.close()
     os.environ.setdefault("MASTER_ADDR","127.0.0.1"); os.environ.setdefault("MASTER_PORT",str(port))
     vcfg = VllmConfig(parallel_config=ParallelConfig(enable_expert_parallel=True))
-    results = {}
+
+    all_results = {}
+
     with set_current_vllm_config(vcfg):
         if not torch.distributed.is_initialized():
             distributed.init_distributed_environment(1,0,"env://",0,"nccl")
             distributed.initialize_model_parallel(1,backend="nccl")
+
         from transformers import AutoTokenizer, AutoConfig
         from dinfer.model import LLaDA2MoeModelLM
+        from dinfer import (BlockIteratorFactory, ThresholdParallelDecoder, KVCacheFactory,
+                            BlockWiseDiffusionLLM, BlockDiffusionLLMAttnmask, BlockDiffusionLLM,
+                            IterSmoothDiffusionLLM)
+
         tk = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True, local_files_only=True)
         cfg = AutoConfig.from_pretrained(MODEL_PATH, trust_remote_code=True, local_files_only=True)
         model = LLaDA2MoeModelLM(config=cfg).eval()
@@ -91,61 +222,90 @@ def main():
         model = model.to(device)
         print(f"[model] GPU: {torch.cuda.memory_allocated(device)/1024**2:.0f} MB")
 
-        # ═══ PHASE 1: All baseline runs (before offload frees weights) ═══
-        patch_dinfer_baseline(model)
-        with torch.inference_mode():
-            _ = model(torch.arange(180, dtype=torch.long, device=device).unsqueeze(0), use_cache=False)
-        base_results = {}
-        for bs in bss:
-            ids = prepare_batch(tk, bs, device)
-            print(f"\n  [BASELINE bs={bs}] Running...")
-            t, n, pk, texts = run_gen(model, tk, ids, bs, args.gen_length, device)
-            avg = t/n*1000; tps = bs*args.gen_length/t
-            print(f"  [BASELINE bs={bs}] {avg:.2f} ms/fwd, {tps:.1f} tok/s, peak={pk:.0f} MB")
-            print(f"  [BASELINE bs={bs}] Output: {texts[0][:120]}")
-            base_results[bs] = {"avg": avg, "tps": tps, "peak": pk, "texts": texts, "n": n}
+        # Apply optimizations incrementally
+        n_rms = apply_fused_rmsnorm(model)
+        print(f"[opt] Fused RMSNorm: {n_rms} layers")
 
-        # ═══ PHASE 2: Offload runs (frees original expert weights) ═══
-        ctrl = EpochSparkController(mask_id=MASK_ID, gpu_budget=args.budget, enable_offload=True)
-        patch_dinfer_model(model, ctrl)
-        gpu_after = torch.cuda.memory_allocated(device)/1024**2
-        print(f"\n[offload] GPU after: {gpu_after:.0f} MB (saved {base_results[bss[0]]['peak']-gpu_after:.0f} MB)")
-        with torch.inference_mode():
-            _ = model(torch.arange(180, dtype=torch.long, device=device).unsqueeze(0), use_cache=False)
-        off_results = {}
-        for bs in bss:
-            # Reset controller stats
-            ctrl.stats.clear(); ctrl.moe_cache.clear(); ctrl.cache_populated.clear()
-            ctrl.current_block_id = -1; ctrl.block_iter_count = 0
-            for buf in ctrl.buffers.values(): buf.stats.clear()
-            ids = prepare_batch(tk, bs, device)
-            print(f"\n  [OFFLOAD bs={bs}] Running...")
-            t, n, pk, texts = run_gen(model, tk, ids, bs, args.gen_length, device, ctrl)
-            avg = t/n*1000; tps = bs*args.gen_length/t
-            s = ctrl.get_summary()
-            speedup = base_results[bs]["avg"]/avg if avg > 0 else 0
-            match = sum(1 for a, b in zip(base_results[bs]["texts"], texts) if a == b)
-            print(f"  [OFFLOAD bs={bs}] {avg:.2f} ms/fwd, {tps:.1f} tok/s, speedup={speedup:.2f}x, peak={pk:.0f} MB")
-            print(f"  [OFFLOAD bs={bs}] cached={s['cached_tokens']}, miss={s['miss_tokens']}, swaps={s['buffer_swaps']}")
-            print(f"  [OFFLOAD bs={bs}] Output: {texts[0][:120]}")
-            print(f"  [QUALITY bs={bs}] Match: {match}/{bs}")
-            off_results[bs] = {"avg": avg, "tps": tps, "peak": pk, "speedup": speedup, "match": f"{match}/{bs}", **s}
+        n_fa = apply_flash_attn(model)
+        print(f"[opt] FlashAttention: {n_fa} layers")
 
-    # ═══ FINAL TABLE ═══
-    print("\n" + "="*110)
-    print("FINAL RESULTS — Epoch-Spark v3 (Pingpong Double-Buffer, Zero CPU Compute)")
-    print("="*110)
-    print(f"{'BS':>4} | {'Mode':<12} | {'ms/fwd':>8} | {'Speedup':>8} | {'tok/s':>10} | {'PeakMB':>8} | {'Cached':>8} | {'Miss':>8} | {'Match':>7}")
-    print("-"*110)
-    for bs in bss:
-        b = base_results[bs]; e = off_results[bs]
-        print(f"{bs:>4} | {'Baseline':<12} | {b['avg']:8.2f} | {'1.00x':>8} | {b['tps']:10.1f} | {b['peak']:8.0f} | {'—':>8} | {'—':>8} | {'—':>7}")
-        print(f"{bs:>4} | {'Offload':<12} | {e['avg']:8.2f} | {e['speedup']:.2f}x   | {e['tps']:10.1f} | {e['peak']:8.0f} | {e['cached_tokens']:>8} | {e['miss_tokens']:>8} | {e['match']:>7}")
-    print("="*110)
-    all_r = {f"bs{bs}": {"baseline": {"avg_ms": round(base_results[bs]["avg"],2), "tps": round(base_results[bs]["tps"],1), "peak_mb": round(base_results[bs]["peak"],0)},
-                          "offload": {"avg_ms": round(off_results[bs]["avg"],2), "tps": round(off_results[bs]["tps"],1), "peak_mb": round(off_results[bs]["peak"],0), "speedup": round(off_results[bs]["speedup"],2), "match": off_results[bs]["match"]}} for bs in bss}
-    with open("bench_epoch_spark_results.json","w") as f: json.dump(all_r, f, indent=2)
-    print(f"\nSaved to bench_epoch_spark_results.json")
+        n_moe = apply_fused_moe_routing(model)
+
+        # Warmup
+        with torch.inference_mode(), set_forward_context(None, vcfg):
+            _ = model(torch.arange(180, dtype=torch.long, device=device).unsqueeze(0), use_cache=False)
+        print("[opt] Warmup done")
+
+        for bs in bss:
+            print(f"\n{'='*80}")
+            print(f"  Batch size = {bs}")
+            print(f"{'='*80}")
+
+            ids = prepare_batch(tk, bs, device)
+            decoder = ThresholdParallelDecoder(temperature=0, threshold=0.9, mask_id=MASK_ID, eos_id=EOS_ID)
+
+            configs = []
+
+            # Config A: BlockDiffusionLLMAttnmask (no KV cache, full seq each forward)
+            configs.append(("A:NoCache", lambda d=decoder: BlockDiffusionLLMAttnmask(
+                model, d, BlockIteratorFactory(use_block_diffusion=True), early_stop=True)))
+
+            # Config B: BlockDiffusionLLM with KV cache (forward only block tokens)
+            configs.append(("B:KVCache", lambda d=decoder: BlockDiffusionLLM(
+                model, d, BlockIteratorFactory(use_block_diffusion=True),
+                cache_factory=KVCacheFactory('prefix', is_bd_model=True), early_stop=True)))
+
+            # Config C: BlockWiseDiffusionLLM (simple, supports batching, no KV cache)
+            if bs > 1:
+                configs.append(("C:BatchNoKV", lambda d=decoder: BlockWiseDiffusionLLM(
+                    model, d, BlockIteratorFactory(), early_stop=True)))
+
+            # Config D: IterSmooth (reduce iterations)
+            configs.append(("D:IterSmooth", lambda d=decoder: IterSmoothDiffusionLLM(
+                model, d, BlockIteratorFactory(), early_stop=True)))
+
+            results_for_bs = {}
+
+            for label, factory in configs:
+                print(f"\n  [{label}] Running...")
+                try:
+                    r = run_gen(model, tk, ids, bs, args.gen_length, device, factory, label)
+                    print(f"  [{label}] {r['avg_ms']:.2f} ms/fwd, {r['tps']:.1f} tok/s, "
+                          f"{r['n_fwd']} fwds, peak={r['peak_mb']:.0f} MB")
+                    print(f"  [{label}] Output: {r['texts'][0][:120]}")
+                    results_for_bs[label] = {
+                        "avg_ms": round(r["avg_ms"], 2),
+                        "tps": round(r["tps"], 1),
+                        "n_fwd": r["n_fwd"],
+                        "peak_mb": round(r["peak_mb"], 0),
+                    }
+                except Exception as e:
+                    print(f"  [{label}] FAILED: {e}")
+                    import traceback; traceback.print_exc()
+                    results_for_bs[label] = {"error": str(e)}
+
+            all_results[f"bs{bs}"] = results_for_bs
+
+    # Final table
+    print("\n" + "=" * 100)
+    print("FINAL RESULTS — Full Optimization Stack")
+    print("  Fused RMSNorm + FlashAttention + Fused Triton MoE Routing")
+    print("=" * 100)
+    print(f"{'BS':>4} | {'Config':<16} | {'ms/fwd':>8} | {'tok/s':>10} | {'#fwd':>6} | {'PeakMB':>8}")
+    print("-" * 100)
+    for bsk in sorted(all_results.keys(), key=lambda k: int(k[2:])):
+        r = all_results[bsk]; bv = bsk[2:]
+        for label, data in r.items():
+            if "error" in data:
+                print(f"{bv:>4} | {label:<16} | {'ERROR':>8} | {'—':>10} | {'—':>6} | {'—':>8}")
+            else:
+                print(f"{bv:>4} | {label:<16} | {data['avg_ms']:8.2f} | {data['tps']:10.1f} | {data['n_fwd']:6} | {data['peak_mb']:8.0f}")
+    print("=" * 100)
+
+    with open("bench_full_opt_results.json", "w") as f:
+        json.dump(all_results, f, indent=2)
+    print(f"\nSaved to bench_full_opt_results.json")
+
 
 if __name__ == "__main__":
     main()

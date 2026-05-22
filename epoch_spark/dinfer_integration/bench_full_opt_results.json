@@ -1,0 +1,59 @@
+{
+  "bs1": {
+    "A:NoCache": {
+      "avg_ms": 42.41,
+      "tps": 23.6,
+      "n_fwd": 128,
+      "peak_mb": 31386.0
+    },
+    "B:KVCache": {
+      "avg_ms": 27.82,
+      "tps": 36.2,
+      "n_fwd": 127,
+      "peak_mb": 31480.0
+    },
+    "D:IterSmooth": {
+      "error": "expected mat1 and mat2 to have the same dtype, but got: float != c10::BFloat16"
+    }
+  },
+  "bs16": {
+    "A:NoCache": {
+      "error": "We currently only support batch size = 1."
+    },
+    "B:KVCache": {
+      "avg_ms": 56.16,
+      "tps": 238.3,
+      "n_fwd": 153,
+      "peak_mb": 36487.0
+    },
+    "C:BatchNoKV": {
+      "avg_ms": 29.6,
+      "tps": 540.5,
+      "n_fwd": 128,
+      "peak_mb": 33444.0
+    },
+    "D:IterSmooth": {
+      "error": "expected mat1 and mat2 to have the same dtype, but got: float != c10::BFloat16"
+    }
+  },
+  "bs64": {
+    "A:NoCache": {
+      "error": "We currently only support batch size = 1."
+    },
+    "B:KVCache": {
+      "avg_ms": 34.27,
+      "tps": 1562.5,
+      "n_fwd": 153,
+      "peak_mb": 52507.0
+    },
+    "C:BatchNoKV": {
+      "avg_ms": 88.9,
+      "tps": 719.9,
+      "n_fwd": 128,
+      "peak_mb": 40338.0
+    },
+    "D:IterSmooth": {
+      "error": "expected mat1 and mat2 to have the same dtype, but got: float != c10::BFloat16"
+    }
+  }
+}
