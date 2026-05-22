@@ -314,31 +314,13 @@ class EpochSparkController:
 # ════════════════════════════════════════════════════════════════
 
 def _vectorized_grouped_topk(gate, flat):
+    """Use Triton fused routing kernel (replaces Python topk+sort)."""
+    from dinfer.triton_ops import triton_routing
     gating_output = gate.get_logits(flat)
-    scores = torch.sigmoid(gating_output.float())
-    scores_for_routing = scores + gate.expert_bias
-
-    n_group = gate.n_group
-    topk_group = gate.topk_group
-    num_experts = gate.num_experts
-    top_k = gate.top_k
-    group_size = num_experts // n_group
-
-    grouped = scores_for_routing.view(-1, n_group, group_size)
-    group_scores = grouped.topk(2, dim=-1).values.sum(dim=-1)
-    top_group_idx = group_scores.topk(topk_group, dim=-1).indices
-
-    gmask = torch.zeros(scores.shape[0], n_group, device=scores.device, dtype=scores.dtype)
-    gmask.scatter_(1, top_group_idx, 1.0)
-    gmask = gmask.unsqueeze(2).expand(-1, -1, group_size).reshape(-1, num_experts)
-
-    masked = scores_for_routing * gmask
-    _, topk_idx = masked.topk(top_k, dim=1)
-
-    topk_w = torch.gather(scores, 1, topk_idx)
-    topk_w = topk_w / (topk_w.sum(dim=-1, keepdim=True) + 1e-20)
-    topk_w = topk_w * gate.routed_scaling_factor
-    return topk_w, topk_idx
+    return triton_routing(
+        gating_output, gate.expert_bias, gate.routed_scaling_factor,
+        K=gate.top_k, ng=gate.n_group, tkg=gate.topk_group,
+    )
 
 
 # ════════════════════════════════════════════════════════════════

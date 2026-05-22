@@ -148,29 +148,13 @@ def apply_dtype_optimized_moe(model):
                 bsz, seq_len, h = hidden_states.shape
                 flat = hidden_states.view(-1, h)
 
-                # Routing — minimize dtype conversions
+                # Triton fused routing (replaces Python sigmoid+topk+sort)
+                from dinfer.triton_ops import triton_routing
                 gating = _gate.get_logits(flat)
-                # Stay in bf16 for sigmoid (avoid float32 roundtrip)
-                scores = torch.sigmoid(gating)
-                scores_routing = scores + _gate.expert_bias.to(scores.dtype)
-
-                n_group = _gate.n_group
-                topk_group = _gate.topk_group
-                group_size = _gE // n_group
-
-                grouped = scores_routing.view(-1, n_group, group_size)
-                group_scores = grouped.topk(2, dim=-1).values.sum(dim=-1)
-                top_gidx = group_scores.topk(topk_group, dim=-1).indices
-
-                gmask = torch.zeros(flat.shape[0], n_group, device=flat.device, dtype=scores.dtype)
-                gmask.scatter_(1, top_gidx, 1.0)
-                gmask = gmask.unsqueeze(2).expand(-1, -1, group_size).reshape(-1, _gE)
-
-                masked = scores_routing * gmask
-                _, topk_idx = masked.topk(_gate.top_k, dim=1)
-                topk_w = torch.gather(scores, 1, topk_idx)
-                topk_w = topk_w / (topk_w.sum(dim=-1, keepdim=True) + 1e-20)
-                topk_w = topk_w * _gate.routed_scaling_factor
+                topk_w, topk_idx = triton_routing(
+                    gating, _gate.expert_bias, _gate.routed_scaling_factor,
+                    K=_gate.top_k, ng=_gate.n_group, tkg=_gate.topk_group,
+                )
 
                 y = fused_experts_impl(
                     flat, _exp.w13_weight, _exp.w2_weight,
