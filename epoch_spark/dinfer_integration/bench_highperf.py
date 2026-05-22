@@ -90,7 +90,17 @@ def apply_optimized_attn(model):
                 cos, sin = position_embeddings
                 q, k = apply_rotary_pos_emb(q, k, cos, sin)
                 if past_key_value is not None:
-                    k, v = past_key_value.update(k, v, attn.layer_idx, replace_position)
+                    if hasattr(past_key_value, 'update'):
+                        try:
+                            k, v = past_key_value.update(k, v, attn.layer_idx, replace_position)
+                        except (AssertionError, TypeError):
+                            # DynamicCache from transformers: update(k, v, layer_idx)
+                            k, v = past_key_value.update(k, v, attn.layer_idx)
+                    elif isinstance(past_key_value, (list, tuple)):
+                        if len(past_key_value) > attn.layer_idx:
+                            pk, pv = past_key_value[attn.layer_idx]
+                            k = torch.cat([pk, k], dim=2)
+                            v = torch.cat([pv, v], dim=2)
                 pkv = (k, v) if use_cache else None
 
                 if attention_mask is not None:
