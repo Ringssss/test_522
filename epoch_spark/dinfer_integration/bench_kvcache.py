@@ -84,7 +84,9 @@ def main():
             for _ in range(3): model(w, use_cache=False)
         torch.cuda.synchronize()
 
-        from dinfer.fast_generate import fast_generate_with_kvcache, fast_generate_no_kvcache
+        from dinfer.fast_generate import (fast_generate_with_kvcache,
+                                         fast_generate_with_kvcache_cudagraph,
+                                         fast_generate_no_kvcache)
 
         results = {}
 
@@ -100,58 +102,55 @@ def main():
             input_ids = torch.stack(padded).to(device)
             print(f"  prompt_len={input_ids.shape[1]}, gen_length={args.gen_length}")
 
-            # --- A: No KV cache (full seq every forward) ---
-            print(f"  [A: NoKV] Running...")
-            best_a = 0
-            for ri in range(args.num_runs):
-                torch.cuda.synchronize()
-                t0 = time.perf_counter()
-                with torch.inference_mode():
-                    out_a, n_a = fast_generate_no_kvcache(model, input_ids.clone(), gen_length=args.gen_length, block_length=32)
-                torch.cuda.synchronize()
-                dt = time.perf_counter() - t0
-                tps = bs * args.gen_length / dt
-                ms = dt / n_a * 1000
-                best_a = max(best_a, tps)
-                print(f"    Run {ri+1}: {ms:.2f} ms/fwd, {tps:.0f} tok/s, {n_a} fwds, {dt:.2f}s")
-            text_a = tokenizer.decode(out_a[0], skip_special_tokens=True)
+            configs = [
+                ("NoKV", fast_generate_no_kvcache),
+                ("KVCache", fast_generate_with_kvcache),
+                ("KV+CG", fast_generate_with_kvcache_cudagraph),
+            ]
 
-            # --- B: With KV cache (only block tokens per forward) ---
-            print(f"  [B: KVCache] Running...")
-            best_b = 0
-            for ri in range(args.num_runs):
-                torch.cuda.synchronize()
-                t0 = time.perf_counter()
-                with torch.inference_mode():
-                    out_b, n_b = fast_generate_with_kvcache(model, input_ids.clone(), gen_length=args.gen_length, block_length=32)
-                torch.cuda.synchronize()
-                dt = time.perf_counter() - t0
-                tps = bs * args.gen_length / dt
-                ms = dt / n_b * 1000
-                best_b = max(best_b, tps)
-                print(f"    Run {ri+1}: {ms:.2f} ms/fwd, {tps:.0f} tok/s, {n_b} fwds, {dt:.2f}s")
-            text_b = tokenizer.decode(out_b[0], skip_special_tokens=True)
+            bs_results = {}
+            for label, gen_fn in configs:
+                print(f"  [{label}] Running...")
+                # Warmup
+                try:
+                    with torch.inference_mode():
+                        gen_fn(model, input_ids[:min(bs,4)].clone(), gen_length=32, block_length=32)
+                    torch.cuda.synchronize()
+                except Exception as e:
+                    print(f"  [{label}] Warmup failed: {e}")
+                    bs_results[label] = {"tps": 0, "error": str(e)}
+                    continue
 
-            speedup = best_b / best_a if best_a > 0 else 0
+                best_tps = 0
+                for ri in range(args.num_runs):
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter()
+                    with torch.inference_mode():
+                        out, n = gen_fn(model, input_ids.clone(), gen_length=args.gen_length, block_length=32)
+                    torch.cuda.synchronize()
+                    dt = time.perf_counter() - t0
+                    tps = bs * args.gen_length / dt
+                    ms = dt / n * 1000
+                    best_tps = max(best_tps, tps)
+                    print(f"    Run {ri+1}: {ms:.2f} ms/fwd, {tps:.0f} tok/s, {n} fwds")
 
-            print(f"\n  [A] Output: {text_a[:120]}")
-            print(f"  [B] Output: {text_b[:120]}")
-            print(f"  Speedup: {speedup:.2f}x")
+                text = tokenizer.decode(out[0], skip_special_tokens=True)
+                print(f"    Output: {text[:100]}")
+                bs_results[label] = {"tps": round(best_tps, 0)}
 
-            results[f"bs{bs}"] = {
-                "no_kv": {"tps": round(best_a, 0)},
-                "kv_cache": {"tps": round(best_b, 0)},
-                "speedup": round(speedup, 2),
-            }
+            results[f"bs{bs}"] = bs_results
 
     print("\n" + "=" * 80)
-    print("FINAL RESULTS — KV Cache vs No KV Cache")
+    print("FINAL RESULTS")
     print("=" * 80)
-    print(f"{'BS':>4} | {'NoKV tok/s':>12} | {'KVCache tok/s':>13} | {'Speedup':>8}")
+    print(f"{'BS':>4} | {'NoKV':>10} | {'KVCache':>10} | {'KV+CG':>10}")
     print("-" * 60)
     for bsk in sorted(results.keys(), key=lambda k: int(k[2:])):
         r = results[bsk]; bv = bsk[2:]
-        print(f"{bv:>4} | {r['no_kv']['tps']:12.0f} | {r['kv_cache']['tps']:13.0f} | {r['speedup']:.2f}x")
+        nk = r.get("NoKV", {}).get("tps", 0)
+        kv = r.get("KVCache", {}).get("tps", 0)
+        cg = r.get("KV+CG", {}).get("tps", 0)
+        print(f"{bv:>4} | {nk:10.0f} | {kv:10.0f} | {cg:10.0f}")
     print("=" * 80)
 
     with open("bench_kvcache_results.json", "w") as f:
