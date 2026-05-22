@@ -498,6 +498,13 @@ def _make_baseline_forward(moe_block):
     experts = moe_block.experts
     shared = getattr(moe_block, 'shared_experts', None)
 
+    # Build expert_map for EP sharding: maps global expert ID → local tensor index
+    local_num_experts = experts.w13_weight.shape[0]
+    global_num_experts = gate.num_experts
+    expert_map = getattr(experts, 'expert_map', None)
+    if expert_map is not None:
+        expert_map = expert_map.to(experts.w13_weight.device)
+
     def fwd(hidden_states):
         res = shared(hidden_states) if shared is not None else 0
         bsz, seq_len, h = hidden_states.shape
@@ -506,6 +513,8 @@ def _make_baseline_forward(moe_block):
         y = fused_experts_impl(
             flat, experts.w13_weight, experts.w2_weight,
             topk_w.float(), topk_idx, inplace=False, activation="silu",
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
         ).to(flat.dtype)
         y = y.view(bsz, seq_len, h)
         if shared is not None:
